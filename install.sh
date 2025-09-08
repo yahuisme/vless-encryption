@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # VLESS Encryption 一键安装管理脚本
-# 版本: V1.5.1 (修复IP地址获取逻辑)
+# 版本: V1.5.2
 # 固定配置: native + 0-RTT + ML-KEM-768
 
 set -e
 
 # --- 全局变量 ---
-SCRIPT_VERSION="V1.5.1"
+SCRIPT_VERSION="V1.5.2"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -472,7 +472,7 @@ view_subscription_info() {
     fi
 
     local link_name_encoded
-    link_name_encoded=$(hostname | sed 's/ /%20/g')
+    link_name_encoded="$(hostname)%20VLESS-E"
 
     # 如果是IPv6地址，需要用[]括起来
     local address_for_url=$display_ip
@@ -480,7 +480,7 @@ view_subscription_info() {
         address_for_url="[${display_ip}]"
     fi
 
-    local vless_url="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&type=tcp&security=none#${link_name_encoded}_VLESS-E"
+    local vless_url="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&type=tcp&security=none#${link_name_encoded}"
 
     if [ "$is_quiet" = true ]; then
         echo "${vless_url}"
@@ -488,7 +488,7 @@ view_subscription_info() {
         echo "${vless_url}" > ~/xray_vless_encryption_link.txt
         echo "----------------------------------------------------------------"
         cecho "$C_CYAN" " --- Xray VLESS-Encryption 订阅信息 --- "
-        echo " 名称: $(cecho "$C_PURPLE" "${link_name_encoded}_VLESS-E")"
+        echo " 名称: $(cecho "$C_PURPLE" "$(hostname) VLESS-E")"
         if [ -n "$ip4" ]; then
             echo " 地址(IPv4): $(cecho "$C_PURPLE" "$ip4")"
         fi
