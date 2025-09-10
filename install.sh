@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # VLESS Encryption 一键安装管理脚本
-# 版本: V1.5.2
-# 固定配置: native + 0-RTT + ML-KEM-768
+# 版本: V1.5.5 (菜单文本优化)
+# 固定配置: native + 0-RTT + ML-KEM-768 + xtls-rprx-vision
 
 set -e
 
 # --- 全局变量 ---
-SCRIPT_VERSION="V1.5.2"
+SCRIPT_VERSION="V1.5.5"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -211,7 +211,7 @@ generate_vless_encryption_config() {
     while IFS= read -r line; do
         if [ "$in_mlkem_section" = true ] && [[ "$line" != *'"decryption":'* ]] && [[ "$line" != *'"encryption":'* ]] && [[ "$parsing_encryption" = false ]] && [ -n "$decryption_config" ] && [ -n "$encryption_config" ]; then
              if [[ ! "$line" =~ ^[[:space:]]*"\"" ]]; then
-                 break
+                  break
              fi
         fi
 
@@ -480,7 +480,7 @@ view_subscription_info() {
         address_for_url="[${display_ip}]"
     fi
 
-    local vless_url="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&type=tcp&security=none#${link_name_encoded}"
+    local vless_url="vless://${uuid}@${address_for_url}:${port}?encryption=${encryption}&flow=xtls-rprx-vision&type=tcp&security=none#${link_name_encoded}"
 
     if [ "$is_quiet" = true ]; then
         echo "${vless_url}"
@@ -498,6 +498,7 @@ view_subscription_info() {
         echo " 端口: $(cecho "$C_PURPLE" "$port")"
         echo " UUID: $(cecho "$C_PURPLE" "$uuid")"
         echo " 协议: $(cecho "$C_YELLOW" "VLESS Encryption (native + 0-RTT + ML-KEM-768)")"
+        echo " 流控: $(cecho "$C_YELLOW" "xtls-rprx-vision")"
         echo "----------------------------------------------------------------"
         cecho "$C_GREEN" " 订阅链接 (已保存到 ~/xray_vless_encryption_link.txt): "
         echo
@@ -511,10 +512,12 @@ write_config() {
 
     echo "$encryption_config" > ~/xray_encryption_info.txt
 
+    # 已移除 streamSettings，因为 "network": "tcp" 是默认行为，可省略
     jq -n \
         --argjson port "$port" \
         --arg uuid "$uuid" \
         --arg decryption "$decryption_config" \
+        --arg flow "xtls-rprx-vision" \
     '{
         "log": {"loglevel": "warning"},
         "inbounds": [{
@@ -522,12 +525,8 @@ write_config() {
             "port": $port,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": $uuid}],
+                "clients": [{"id": $uuid, "flow": $flow}],
                 "decryption": $decryption
-            },
-            "streamSettings": {
-                "network": "tcp",
-                "security": "none"
             }
         }],
         "outbounds": [{
@@ -590,15 +589,17 @@ main_menu() {
         check_xray_status
         echo "  ${xray_status_info}"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
-        cecho "$C_PURPLE" "  1. 安装/重装 Xray         6. 修改节点配置"
-        cecho "$C_PURPLE" "  2. 更新 Xray              7. 查看订阅信息"
+        cecho "$C_PURPLE" "  1. 安装/重装 Xray (VLESS-Encryption)"
+        cecho "$C_PURPLE" "  2. 更新 Xray"
         cecho "$C_PURPLE" "  3. 重启 Xray"
         cecho "$C_PURPLE" "  4. 卸载 Xray"
         cecho "$C_PURPLE" "  5. 查看 Xray 日志"
+        cecho "$C_PURPLE" "  6. 修改节点配置"
+        cecho "$C_PURPLE" "  7. 查看订阅信息"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
         cecho "$C_RED"    "  0. 退出脚本"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
-        cecho "$C_YELLOW" "  注意: 使用 native + 0-RTT + ML-KEM-768 抗量子加密"
+        cecho "$C_YELLOW" "  注意: 使用 native + 0-RTT + ML-KEM-768 + xtls-rprx-vision"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
         echo -n "  请输入选项 [0-7]: "
         read -r choice
@@ -660,15 +661,16 @@ show_help() {
     echo "   $0 install [选项]  # 静默安装"
     echo
     echo "安装选项:"
-    echo "   --port <端口>      # 监听端口 (默认: 443)"
-    echo "   --uuid <UUID>      # 用户UUID (默认: 自动生成)"
-    echo "   --quiet, -q        # 静默模式，只输出订阅链接"
+    echo "   --port <端口>     # 监听端口 (默认: 443)"
+    echo "   --uuid <UUID>     # 用户UUID (默认: 自动生成)"
+    echo "   --quiet, -q       # 静默模式，只输出订阅链接"
     echo
     echo "固定配置 (最优设置):"
     echo "   协议: VLESS Encryption"
     echo "   外观: native (原生外观，性能最佳，支持XTLS完全穿透)"
     echo "   RTT:  0rtt (密钥复用600秒，性能优化)"
     echo "   认证: mlkem768 (ML-KEM-768 抗量子加密)"
+    echo "   流控: xtls-rprx-vision (推荐的流控方式)"
     echo
     echo "示例:"
     echo "   $0 install --port 8443"
