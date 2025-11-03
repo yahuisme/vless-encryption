@@ -1,13 +1,16 @@
 #!/bin/bash
 
 # VLESS Encryption 一键安装管理脚本
-# 版本: V1.5.5 (菜单文本优化)
+# 版本: V1.5.6 (安全增强)
+# 更新日志 (V1.5.6):
+# - [安全] 优化官方脚本执行方式 (预下载+内容检查)
+# - [安全] 配置文件写入后设置标准权限 (644)
 # 固定配置: native + 0-RTT + ML-KEM-768 + xtls-rprx-vision
 
 set -e
 
 # --- 全局变量 ---
-SCRIPT_VERSION="V1.5.5"
+SCRIPT_VERSION="V1.5.6"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -95,10 +98,21 @@ get_public_ip_v6() {
     echo ""
 }
 
+# 改进：采纳 execute_official_script() 安全建议
 execute_official_script() {
     local args="$1"
-    info "正在执行官方安装脚本..."
-    curl -sL "$xray_install_script_url" | bash -s -- $args
+    local script_content
+    info "正在下载官方安装脚本..."
+    script_content=$(curl -sL "$xray_install_script_url")
+
+    # 安全增强：检查脚本内容
+    if [[ -z "$script_content" || ! "$script_content" =~ "install-release" ]]; then
+        error "下载 Xray 官方安装脚本失败或内容异常！请检查网络连接。"
+        return 1
+    fi
+    
+    info "正在执行官方安装脚本 ( $args )..."
+    echo "$script_content" | bash -s -- $args
 }
 
 check_xray_version() {
@@ -211,7 +225,7 @@ generate_vless_encryption_config() {
     while IFS= read -r line; do
         if [ "$in_mlkem_section" = true ] && [[ "$line" != *'"decryption":'* ]] && [[ "$line" != *'"encryption":'* ]] && [[ "$parsing_encryption" = false ]] && [ -n "$decryption_config" ] && [ -n "$encryption_config" ]; then
              if [[ ! "$line" =~ ^[[:space:]]*"\"" ]]; then
-                  break
+                 break
              fi
         fi
 
@@ -507,6 +521,7 @@ view_subscription_info() {
     fi
 }
 
+# 改进：采纳 配置文件权限 建议
 write_config() {
     local port="$1" uuid="$2" decryption_config="$3" encryption_config="$4"
 
@@ -536,6 +551,10 @@ write_config() {
             }
         }]
     }' > "$xray_config_path"
+
+    # 安全增强：设置标准文件权限
+    chmod 644 "$xray_config_path"
+    chown root:root "$xray_config_path"
 }
 
 run_install() {
@@ -661,9 +680,9 @@ show_help() {
     echo "   $0 install [选项]  # 静默安装"
     echo
     echo "安装选项:"
-    echo "   --port <端口>     # 监听端口 (默认: 443)"
-    echo "   --uuid <UUID>     # 用户UUID (默认: 自动生成)"
-    echo "   --quiet, -q       # 静默模式，只输出订阅链接"
+    echo "   --port <端口>    # 监听端口 (默认: 443)"
+    echo "   --uuid <UUID>      # 用户UUID (默认: 自动生成)"
+    echo "   --quiet, -q        # 静默模式，只输出订阅链接"
     echo
     echo "固定配置 (最优设置):"
     echo "   协议: VLESS Encryption"
