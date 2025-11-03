@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # VLESS Encryption 一键安装管理脚本
-# 版本: V1.5.6 (安全增强)
-# 更新日志 (V1.5.6):
+# 版本: V1.5.7 (UI颜色调整)
+# 更新日志 (V1.5.7):
+# - [UI] 调整菜单和输出颜色 (紫色 -> 绿色)
 # - [安全] 优化官方脚本执行方式 (预下载+内容检查)
 # - [安全] 配置文件写入后设置标准权限 (644)
 # 固定配置: native + 0-RTT + ML-KEM-768 + xtls-rprx-vision
@@ -10,7 +11,7 @@
 set -e
 
 # --- 全局变量 ---
-SCRIPT_VERSION="V1.5.6"
+SCRIPT_VERSION="V1.5.7"
 xray_config_path="/usr/local/etc/xray/config.json"
 xray_binary_path="/usr/local/bin/xray"
 xray_install_script_url="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
@@ -502,15 +503,18 @@ view_subscription_info() {
         echo "${vless_url}" > ~/xray_vless_encryption_link.txt
         echo "----------------------------------------------------------------"
         cecho "$C_CYAN" " --- Xray VLESS-Encryption 订阅信息 --- "
-        echo " 名称: $(cecho "$C_PURPLE" "$(hostname) VLESS-E")"
+        
+        # 修改：C_PURPLE -> C_GREEN
+        echo " 名称: $(cecho "$C_GREEN" "$(hostname) VLESS-E")"
         if [ -n "$ip4" ]; then
-            echo " 地址(IPv4): $(cecho "$C_PURPLE" "$ip4")"
+            echo " 地址(IPv4): $(cecho "$C_GREEN" "$ip4")"
         fi
         if [ -n "$ip6" ]; then
-            echo " 地址(IPv6): $(cecho "$C_PURPLE" "$ip6")"
+            echo " 地址(IPv6): $(cecho "$C_GREEN" "$ip6")"
         fi
-        echo " 端口: $(cecho "$C_PURPLE" "$port")"
-        echo " UUID: $(cecho "$C_PURPLE" "$uuid")"
+        echo " 端口: $(cecho "$C_GREEN" "$port")"
+        echo " UUID: $(cecho "$C_GREEN" "$uuid")"
+        
         echo " 协议: $(cecho "$C_YELLOW" "VLESS Encryption (native + 0-RTT + ML-KEM-768)")"
         echo " 流控: $(cecho "$C_YELLOW" "xtls-rprx-vision")"
         echo "----------------------------------------------------------------"
@@ -608,13 +612,16 @@ main_menu() {
         check_xray_status
         echo "  ${xray_status_info}"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
-        cecho "$C_PURPLE" "  1. 安装/重装 Xray (VLESS-Encryption)"
-        cecho "$C_PURPLE" "  2. 更新 Xray"
-        cecho "$C_PURPLE" "  3. 重启 Xray"
-        cecho "$C_PURPLE" "  4. 卸载 Xray"
-        cecho "$C_PURPLE" "  5. 查看 Xray 日志"
-        cecho "$C_PURPLE" "  6. 修改节点配置"
-        cecho "$C_PURPLE" "  7. 查看订阅信息"
+        
+        # 修改：C_PURPLE -> C_GREEN
+        cecho "$C_GREEN" "  1. 安装/重装 Xray (VLESS-Encryption)"
+        cecho "$C_GREEN" "  2. 更新 Xray"
+        cecho "$C_GREEN" "  3. 重启 Xray"
+        cecho "$C_GREEN" "  4. 卸载 Xray"
+        cecho "$C_GREEN" "  5. 查看 Xray 日志"
+        cecho "$C_GREEN" "  6. 修改节点配置"
+        cecho "$C_GREEN" "  7. 查看订阅信息"
+        
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
         cecho "$C_RED"    "  0. 退出脚本"
         cecho "$C_GREEN"  "─────────────────────────────────────────────────────"
