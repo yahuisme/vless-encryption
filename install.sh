@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Xray VLESS Encryption unified installer
-# 版本: v26.08.27
+# 版本: v26.08.29
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.08.27"
+SCRIPT_VERSION="v26.08.29"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -25,7 +25,7 @@ C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'; C_MAGENTA='\033[0;35m'; C_WHITE='\033[
 
 color_enabled() {
     local fd="${1:-1}"
-    [ "${NO_COLOR:-}" = 1 ] && return 1
+    [ -n "${NO_COLOR:-}" ] && return 1
     [ "${TERM:-}" = dumb ] && return 1
     [ "$fd" = 2 ] && [ -t 2 ] && return 0
     [ "$fd" = 1 ] && [ -t 1 ]
@@ -57,9 +57,28 @@ require_root_and_dependencies() {
             dnf|yum) "$pm" install -y curl jq coreutils ;;
         esac
     fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
+        error "依赖安装失败，请手动安装 curl、jq、coreutils 后重试。"
+        exit 1
+    fi
 }
 
-valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+# 端口占用预检查（无 ss 时跳过，由 restart 失败兜底）
+port_in_use() {
+    local port=$1
+    command -v ss >/dev/null 2>&1 || return 1
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . && return 0
+    ss -H -lun "sport = :$port" 2>/dev/null | grep -q . && return 0
+    return 1
+}
+
+# 当前配置端口（用于同端口重装/修改时豁免占用检查）
+current_port() {
+    [ -f "$XRAY_CONFIG" ] || return 0
+    jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null || true
+}
+
+valid_port() { [[ "$1" =~ ^([1-9][0-9]*|0)$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 valid_sni() {
     local label
     local -a sni_labels
@@ -74,7 +93,7 @@ valid_sni() {
     [ "${#sni_labels[@]}" -ge 2 ]
 }
 valid_short_id() { [[ "$1" =~ ^([0-9A-Fa-f]{2}){1,8}$ ]]; }
-valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; }
+valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
 valid_auth() { [ "$1" = mlkem768 ] || [ "$1" = x25519 ]; }
 valid_appearance() { [ "$1" = native ] || [ "$1" = xorpub ] || [ "$1" = random ]; }
 
@@ -162,14 +181,15 @@ validate_encryption_token() {
     prefix=${fields[0]}; mode=${fields[1]}; rtt=${fields[2]}
     [ "$prefix" = mlkem768x25519plus ] && valid_appearance "$mode" && [ "$rtt" = "$expected_rtt" ] || return 1
 
-    # Xray accepts optional short dot-separated padding fields. Key fields
-    # are URL-safe Base64 and differ by direction/authentication mode.
+    # Xray accepts optional short dot-separated padding fields. All segments
+    # (padding or key) must be URL-safe Base64 characters; key fields differ
+    # by direction/authentication mode.
     for segment in "${fields[@]:3}"; do
         [ -n "$segment" ] || return 1
+        [[ "$segment" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
         if [ "${#segment}" -lt 20 ]; then
             continue
         fi
-        [[ "$segment" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
         normalized=$(printf '%s' "$segment" | tr '_-' '/+')
         padding=$(( (4 - ${#normalized} % 4) % 4 ))
         normalized+=$(printf '%*s' "$padding" '' | tr ' ' '=')
@@ -232,7 +252,7 @@ write_config() {
     chmod 600 "$tmp"
     if [ "$mode" = reality ]; then
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" --arg private "$private" --arg sni "$sni" --arg sid "$short_id" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid],fingerprint:"chrome"}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp"
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp"
     else
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" '
           {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp"
@@ -282,7 +302,7 @@ public_ip() {
     local ip valid octet
     local -a ip_octets
     for endpoint in https://api-ipv4.ip.sb/ip https://api.ipify.org https://ip.seeip.org; do
-        ip=$(curl -4s --max-time 5 "$endpoint" 2>/dev/null || true)
+        ip=$(curl -4fs --max-time 5 "$endpoint" 2>/dev/null || true)
         if [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
             valid=true
             IFS='.' read -r -a ip_octets <<< "$ip"
@@ -291,8 +311,10 @@ public_ip() {
         fi
     done
     for endpoint in https://api-ipv6.ip.sb/ip https://api64.ipify.org; do
-        ip=$(curl -6s --max-time 5 "$endpoint" 2>/dev/null || true)
-        [[ "$ip" == *:* ]] && { printf '[%s]\n' "$ip"; return; }
+        ip=$(curl -6fs --max-time 5 "$endpoint" 2>/dev/null || true)
+        if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
+            printf '[%s]\n' "$ip"; return
+        fi
     done
     return 1
 }
@@ -360,14 +382,21 @@ xray_status_line() {
 
 uninstall_xray() {
     local confirm
-    if [ ! -x "$XRAY_BIN" ]; then error "Xray 尚未安装。"; return 1; fi
+    if [ ! -x "$XRAY_BIN" ] && [ ! -f "$XRAY_CONFIG" ] && [ ! -f "$ENCRYPTION_INFO" ] && [ ! -f "$REALITY_INFO" ]; then
+        error "未检测到 Xray 安装或残留文件。"
+        return 1
+    fi
     echo
     cecho "$C_YELLOW" "  即将卸载 Xray，并使用官方 --purge 清除 Xray 的全部配置和文件。"
     cecho "$C_YELLOW" "  这不仅限于本脚本生成的文件，操作不可恢复。"
     read -r -p "  确定继续？[y/N]: " confirm || { error "读取确认失败，已取消卸载。"; return 2; }
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then info "已取消卸载。"; return 0; fi
     print_step 1 3 "正在停止并卸载 Xray..."
-    if ! run_official_installer remove --purge; then error "Xray 卸载失败。"; return 1; fi
+    if [ -x "$XRAY_BIN" ] || [ -f /etc/systemd/system/xray.service ]; then
+        if ! run_official_installer remove --purge; then error "Xray 卸载失败。"; return 1; fi
+    else
+        info "Xray 二进制与服务不存在，跳过官方卸载，仅清理残留。"
+    fi
     print_step 2 3 "正在清除客户端信息..."
     rm -f "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"
     print_step 3 3 "正在确认卸载结果..."
@@ -426,6 +455,13 @@ restore_install_snapshot() {
     success "安装回滚完成。"
 }
 clear_install_snapshot() { [ -z "$INSTALL_ROLLBACK_DIR" ] || { rm -rf "$INSTALL_ROLLBACK_DIR"; INSTALL_ROLLBACK_DIR=""; }; }
+# 全新安装失败时撤销官方安装器 enable 的服务（快照中无旧二进制 = 本次全新安装）
+disable_fresh_service() {
+    if [ -n "$INSTALL_ROLLBACK_DIR" ] && [ ! -e "$INSTALL_ROLLBACK_DIR/xray" ]; then
+        systemctl disable --now xray 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
 update_xray() {
     begin_install_snapshot || { error "无法创建更新回滚快照。"; return 1; }
     if ! run_official_installer install; then
@@ -448,6 +484,7 @@ update_xray() {
     return 1
 }
 abort_install() {
+    disable_fresh_service
     restore_install_snapshot || true
     clear_rollback
     systemctl restart xray 2>/dev/null || true
@@ -484,6 +521,7 @@ install_selected() {
         write_config "$port" "$uuid" "$dec" "$enc" encryption || { abort_install; return 1; }
     fi
     if ! restart_xray; then
+        disable_fresh_service
         restore_install_snapshot || true
         clear_rollback
         if ! restart_xray; then
@@ -509,6 +547,10 @@ interactive_install() {
     read -r -p "  请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in 1) mode=encryption;; 2) mode=reality;; *) error "无效选项。"; return 1;; esac
     read -r -p "  端口 [1-65535]（默认 443）：" port || { error "读取端口失败。"; return 2; }; port=${port:-443}; valid_port "$port" || { error "端口无效。"; return 1; }
+    if [ "$port" != "$(current_port)" ] && port_in_use "$port"; then
+        error "端口 $port 已被占用，请选择其他端口。"
+        return 1
+    fi
     read -r -p "  UUID（留空自动生成）：" uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
     if [ "$mode" = reality ]; then
         read -r -p "  REALITY SNI（默认 www.sega.com）：" sni || { error "读取 SNI 失败。"; return 2; }; sni=${sni:-www.sega.com}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
@@ -554,6 +596,10 @@ modify_config() {
     esac
 
     read -r -p "  端口（当前 $port，回车保留）：" input || { error "读取端口失败。"; return 2; }; port=${input:-$port}; valid_port "$port" || { error "端口无效。"; return 1; }
+    if [ "$port" != "$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)" ] && port_in_use "$port"; then
+        error "端口 $port 已被占用，请选择其他端口。"
+        return 1
+    fi
     read -r -p "  UUID（当前 $uuid，回车保留）：" input || { error "读取 UUID 失败。"; return 2; }; uuid=${input:-$uuid}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
 
     if [ "$target_mode" = reality ]; then
@@ -565,7 +611,8 @@ modify_config() {
         fi
         read -r -p "  REALITY SNI（当前/默认 $sni，回车保留）：" input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
         read -r -p "  REALITY Short ID（当前/默认 $sid，回车保留）：" input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
-        if [ "$current_mode" != reality ]; then
+        # 切换模式或客户端信息缺失时重新生成密钥对
+        if [ "$current_mode" != reality ] || [ -z "$private" ] || [ -z "$public" ]; then
             print_step 1 3 "正在生成 REALITY 密钥对..."
             keys=$(generate_reality_keys) || return 1
             IFS='|' read -r private public <<< "$keys"
@@ -582,9 +629,13 @@ modify_config() {
     fi
     print_step 3 3 "正在写入并校验新配置..."
     if [ "$target_mode" = reality ]; then
-        write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid"
-    else
-        write_config "$port" "$uuid" "$dec" "$enc" encryption
+        if ! write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid"; then
+            error "配置写入失败，未修改当前配置。"
+            return 1
+        fi
+    elif ! write_config "$port" "$uuid" "$dec" "$enc" encryption; then
+        error "配置写入失败，未修改当前配置。"
+        return 1
     fi
     if ! restart_xray; then
         error "正在回滚配置。"
@@ -650,7 +701,7 @@ main_menu() {
             0) success "感谢使用。"; return ;;
             *) error "无效选项。" ;;
         esac
-        read -r -n 1 -s -p "  按任意键返回菜单..."; echo
+        read -r -n 1 -s -p "  按任意键返回菜单..." || true; echo
     done
 }
 
@@ -702,13 +753,20 @@ main() {
     valid_uuid "$uuid" || { error "UUID 格式无效。"; exit 1; }
     if [ -n "$sni" ]; then INSTALL_MODE=reality; valid_sni "$sni" || { error "SNI 域名格式无效。"; exit 1; }; valid_short_id "$sid" || { error "Short ID 格式无效。"; exit 1; }
     else INSTALL_MODE=encryption; [ "$REALITY_SHORT_ID_SET" = false ] || { error "--short-id 只能与 --sni（REALITY 模式）一起使用。"; exit 2; }; fi
+    # 端口占用预检查（同端口重装豁免）
+    if [ "$port" != "$(current_port)" ] && port_in_use "$port"; then
+        error "端口 $port 已被占用，请选择其他端口。"
+        exit 1
+    fi
     info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$INSTALL_MODE" "$sni" "$sid"
 }
 
-if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then show_help; exit 0; fi
-if [ ! -t 0 ] && [ "${1:-}" != install ]; then
-    error "交互模式需要 TTY；请使用 install 子命令及非交互参数。"
-    exit 2
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then show_help; exit 0; fi
+    if [ ! -t 0 ] && [ "${1:-}" != install ]; then
+        error "交互模式需要 TTY；请使用 install 子命令及非交互参数。"
+        exit 2
+    fi
+    main "$@"
 fi
-main "$@"
