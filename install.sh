@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Xray VLESS Encryption unified installer
-# 版本: v26.08.29
+# 版本: v26.08.30
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.08.29"
+SCRIPT_VERSION="v26.08.30"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -382,9 +382,9 @@ xray_status_line() {
 
 uninstall_xray() {
     local confirm
-    if [ ! -x "$XRAY_BIN" ] && [ ! -f "$XRAY_CONFIG" ] && [ ! -f "$ENCRYPTION_INFO" ] && [ ! -f "$REALITY_INFO" ]; then
-        error "未检测到 Xray 安装或残留文件。"
-        return 1
+    if [ ! -x "$XRAY_BIN" ] && [ ! -f "$XRAY_CONFIG" ] && [ ! -f "$ENCRYPTION_INFO" ] && [ ! -f "$REALITY_INFO" ] && [ ! -f "$SUBSCRIPTION_INFO" ] && [ ! -f /etc/systemd/system/xray.service ]; then
+        info "Xray 未安装，无需卸载。"
+        return 0
     fi
     echo
     cecho "$C_YELLOW" "  即将卸载 Xray，并使用官方 --purge 清除 Xray 的全部配置和文件。"
