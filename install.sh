@@ -677,7 +677,7 @@ main_menu() {
         print_divider
         read -r -p "  请输入选项 [0-7]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
         case "$choice" in
-            1) interactive_install ;;
+            1) ( interactive_install ) || true ;;
             2)
                 current_version=$(current_xray_version || true)
                 latest_version=$(latest_xray_version || true)
@@ -693,11 +693,11 @@ main_menu() {
                     update_xray || true
                 fi
                 ;;
-            3) restart_xray ;;
-            4) uninstall_xray ;;
+            3) ( restart_xray ) || true ;;
+            4) ( uninstall_xray ) || true ;;
             5) journalctl -u xray -f --no-pager || true ;;
-            6) modify_config ;;
-            7) show_subscription ;;
+            6) ( modify_config ) || true ;;
+            7) ( show_subscription ) || true ;;
             0) success "感谢使用。"; return ;;
             *) error "无效选项。" ;;
         esac
