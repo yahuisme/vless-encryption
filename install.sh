@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Xray VLESS Encryption unified installer
-# 版本: v26.08.30
+# 版本: v26.09.02
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.08.30"
+SCRIPT_VERSION="v26.09.02"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -53,7 +53,7 @@ require_root_and_dependencies() {
     if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
         info "正在安装缺失依赖（curl、jq、coreutils）..."
         case "$pm" in
-            apt) apt-get update && apt-get install -y curl jq coreutils ;;
+            apt) apt-get -o DPkg::Lock::Timeout=600 update && apt-get -o DPkg::Lock::Timeout=600 install -y curl jq coreutils ;;
             dnf|yum) "$pm" install -y curl jq coreutils ;;
         esac
     fi
@@ -63,13 +63,22 @@ require_root_and_dependencies() {
     fi
 }
 
-# 端口占用预检查（无 ss 时跳过，由 restart 失败兜底）
+# 端口占用预检查（无 ss 且无 netstat 时跳过，由 restart 失败兜底）
 port_in_use() {
-    local port=$1
-    command -v ss >/dev/null 2>&1 || return 1
-    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . && return 0
-    ss -H -lun "sport = :$port" 2>/dev/null | grep -q . && return 0
-    return 1
+    local port=$1 port_in_use=false
+    if command -v ss >/dev/null 2>&1; then
+        if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . || \
+           ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
+            port_in_use=true
+        fi
+    fi
+    # ss 不可用或版本过旧（iproute2 < 4.9 无 -H，调用失败）时回退 netstat，避免静默跳过检查
+    if [ "$port_in_use" = false ] && command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" || $4 ~ p" " {found=1} END {exit !found}'; then
+            port_in_use=true
+        fi
+    fi
+    [ "$port_in_use" = true ]
 }
 
 # 当前配置端口（用于同端口重装/修改时豁免占用检查）
@@ -299,20 +308,29 @@ write_config() {
 }
 
 public_ip() {
-    local ip valid octet
+    local ip valid octet cache_file="/usr/local/etc/xray/.public-ip"
     local -a ip_octets
+    # 缓存 1 天，避免每次查看配置都发起网络请求；公网 IP 变更后自动刷新
+    if [ -f "$cache_file" ] && [ -z "$(find "$cache_file" -mmin +1440 2>/dev/null)" ]; then
+        ip=$(<"$cache_file")
+        [ -n "$ip" ] && { printf '%s\n' "$ip"; return; }
+    fi
     for endpoint in https://api-ipv4.ip.sb/ip https://api.ipify.org https://ip.seeip.org; do
         ip=$(curl -4fs --max-time 5 "$endpoint" 2>/dev/null || true)
         if [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
             valid=true
             IFS='.' read -r -a ip_octets <<< "$ip"
             for octet in "${ip_octets[@]}"; do [ "$octet" -le 255 ] || valid=false; done
-            [ "$valid" = true ] && { printf '%s\n' "$ip"; return; }
+            if [ "$valid" = true ]; then
+                printf '%s\n' "$ip" > "$cache_file" 2>/dev/null || true
+                printf '%s\n' "$ip"; return
+            fi
         fi
     done
     for endpoint in https://api-ipv6.ip.sb/ip https://api64.ipify.org; do
         ip=$(curl -6fs --max-time 5 "$endpoint" 2>/dev/null || true)
         if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
+            printf '[%s]\n' "$ip" > "$cache_file" 2>/dev/null || true
             printf '[%s]\n' "$ip"; return
         fi
     done
@@ -464,7 +482,9 @@ disable_fresh_service() {
 }
 update_xray() {
     begin_install_snapshot || { error "无法创建更新回滚快照。"; return 1; }
-    if ! run_official_installer install; then
+    # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
+    # install-geodata 重复；统一由 install-geodata 负责。
+    if ! run_official_installer install --without-geodata; then
         error "Xray 更新失败，正在回滚。"
     elif ! run_official_installer install-geodata; then
         error "GeoIP/GeoSite 更新失败，正在回滚。"
@@ -504,7 +524,9 @@ install_selected() {
     local port="$1" uuid="$2" mode="$3" sni="${4:-}" sid="${5:-}" pair dec enc keys private public
     begin_install_snapshot || { error "无法创建安装回滚快照。"; return 1; }
     print_step 1 5 "正在安装 / 更新 Xray 核心..."
-    run_official_installer install || { error "Xray 核心安装失败。"; abort_install; return 1; }
+    # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
+    # install-geodata 重复；统一由 install-geodata 负责。
+    run_official_installer install --without-geodata || { error "Xray 核心安装失败。"; abort_install; return 1; }
     print_step 2 5 "正在更新 GeoIP 和 GeoSite 数据..."
     run_official_installer install-geodata || { error "Geo 数据更新失败。"; abort_install; return 1; }
     print_step 3 5 "正在生成 VLESS Encryption 密钥材料..."
@@ -762,7 +784,9 @@ main() {
     install_selected "$port" "$uuid" "$INSTALL_MODE" "$sni" "$sid"
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+# 兼容 bash <(curl ...)、直接执行与 curl ... | bash 管道方式；
+# ${BASH_SOURCE[0]:-} 兼容 set -u 下管道模式的空数组
+if [ "${BASH_SOURCE[0]:-}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
     if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then show_help; exit 0; fi
     if [ ! -t 0 ] && [ "${1:-}" != install ]; then
         error "交互模式需要 TTY；请使用 install 子命令及非交互参数。"
