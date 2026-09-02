@@ -20,8 +20,8 @@ ROLLBACK_DIR=""
 INSTALL_ROLLBACK_DIR=""
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'
-C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'
-C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'; C_MAGENTA='\033[0;35m'; C_WHITE='\033[1;37m'
+C_RED='\033[91m'; C_GREEN='\033[92m'; C_YELLOW='\033[93m'
+C_BLUE='\033[94m'; C_CYAN='\033[96m'; C_MAGENTA='\033[95m'
 
 color_enabled() {
     local fd="${1:-1}"
@@ -38,9 +38,18 @@ cecho() {
         printf '%s\n' "$message" >&"$fd"
     fi
 }
-info() { cecho "$C_BLUE" "[!] $1" 2; }
+info() { cecho "$C_YELLOW" "[!] $1" 2; }
 success() { cecho "$C_GREEN" "[✔] $1" 2; }
-error() { cecho "$C_RED" "[✖] $1" 2; }
+warning() { cecho "$C_YELLOW" "[⚠] $1" 2; }
+error() {
+    cecho "$C_RED" "[✖] $1" 2
+    # xray-dual 同款：根据错误内容给出简单建议
+    case "$1" in
+        *"网络"*|*"下载"*) cecho "$C_YELLOW" "提示: 检查网络连接或更换DNS" 2 ;;
+        *"权限"*|*"root"*) cecho "$C_YELLOW" "提示: 请使用 sudo 运行脚本" 2 ;;
+        *"端口"*) cecho "$C_YELLOW" "提示: 尝试使用其他端口号" 2 ;;
+    esac
+}
 section_title() { cecho "$C_MAGENTA$C_BOLD" "◆ $1" 1; }
 
 require_root_and_dependencies() {
@@ -370,20 +379,36 @@ show_subscription() {
 }
 
 print_step() { cecho "$C_BLUE" "  [$1/$2] $3" 2; }
-print_divider() { cecho "$C_CYAN" "────────────────────────────────────────────────" 1; }
+print_divider() { cecho "$C_CYAN" "$(printf '%0.s─' {1..48})" 1; }
+
+# xray-dual 同款菜单项：彩色编号 + 两列对齐
+menu_item() { # <颜色> <编号> <说明>
+    local color="$1" num="$2" label="$3"
+    if color_enabled 1; then
+        printf "  %b%-2s%b %-35s\n" "$color" "$num" "$C_RESET" "$label"
+    else
+        printf "  %-2s %-35s\n" "$num" "$label"
+    fi
+}
+
+# 带颜色的默认值文本（NO_COLOR/非 tty 时纯文本，供 read -p 使用）
+prompt_default() {
+    if color_enabled 1; then printf '%b%s%b' "$C_CYAN" "$1" "$C_RESET"; else printf '%s' "$1"; fi
+}
 
 xray_status_line() {
     local version mode
     if [ ! -x "$XRAY_BIN" ]; then
-        cecho "$C_YELLOW" "  ● Xray：未安装" 1
+        cecho "$C_RED" " Xray 状态: 未安装" 1
         return
     fi
     version=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}' || true)
+    version=${version:-未知}
     local state_text state_color
     if systemctl is-active --quiet xray 2>/dev/null; then
         state_text="运行中"; state_color="$C_GREEN"
     else
-        state_text="未运行"; state_color="$C_RED"
+        state_text="未运行"; state_color="$C_YELLOW"
     fi
     if [ -f "$XRAY_CONFIG" ] && [ "$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG" 2>/dev/null)" = reality ]; then
         mode="VLESS Encryption + REALITY + Vision"
@@ -391,11 +416,12 @@ xray_status_line() {
         mode="VLESS Encryption"
     fi
     if color_enabled 1; then
-        printf '  Xray：%b%s%b  |  %s\n' "$state_color" "$state_text" "$C_RESET" "${version:-未知}"
+        printf ' Xray 状态: %b已安装%b | %b%s%b | 版本: %b%s%b\n' \
+            "$C_GREEN" "$C_RESET" "$state_color" "$state_text" "$C_RESET" "$C_CYAN" "$version" "$C_RESET"
     else
-        printf '  Xray：%s  |  %s\n' "$state_text" "${version:-未知}"
+        printf ' Xray 状态: 已安装 | %s | 版本: %s\n' "$state_text" "$version"
     fi
-    cecho "$C_CYAN" "  当前配置：$mode" 1
+    cecho "$C_CYAN" " 当前配置: $mode" 1
 }
 
 uninstall_xray() {
@@ -562,21 +588,20 @@ interactive_install() {
     local choice port uuid sni="" sid="20220701" mode
     echo
     section_title "请选择安装模式（每次只能安装一种）"
-    echo
-    cecho "$C_GREEN" "  1. VLESS Encryption" 1
-    cecho "$C_YELLOW" "  2. VLESS Encryption + REALITY + Vision" 1
+    menu_item "$C_GREEN" "1." "VLESS Encryption"
+    menu_item "$C_YELLOW" "2." "VLESS Encryption + REALITY + Vision"
     print_divider
-    read -r -p "  请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
+    read -r -p " 请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in 1) mode=encryption;; 2) mode=reality;; *) error "无效选项。"; return 1;; esac
-    read -r -p "  端口 [1-65535]（默认 443）：" port || { error "读取端口失败。"; return 2; }; port=${port:-443}; valid_port "$port" || { error "端口无效。"; return 1; }
+    read -r -p " -> 请输入端口 [1-65535] (默认: $(prompt_default 443)): " port || { error "读取端口失败。"; return 2; }; port=${port:-443}; valid_port "$port" || { error "端口无效。"; return 1; }
     if [ "$port" != "$(current_port)" ] && port_in_use "$port"; then
         error "端口 $port 已被占用，请选择其他端口。"
         return 1
     fi
-    read -r -p "  UUID（留空自动生成）：" uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
+    read -r -p " -> 请输入UUID (留空将自动生成): " uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
     if [ "$mode" = reality ]; then
-        read -r -p "  REALITY SNI（默认 www.sega.com）：" sni || { error "读取 SNI 失败。"; return 2; }; sni=${sni:-www.sega.com}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
-        read -r -p "  REALITY Short ID（默认 20220701）：" sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
+        read -r -p " -> 请输入REALITY SNI域名 (默认: $(prompt_default www.sega.com)): " sni || { error "读取 SNI 失败。"; return 2; }; sni=${sni:-www.sega.com}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
+        read -r -p " -> 请输入REALITY Short ID (默认: $(prompt_default 20220701)): " sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
     fi
     print_divider
     info "开始安装：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
@@ -597,17 +622,17 @@ modify_config() {
 
     echo
     section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
-    cecho "$C_CYAN" "  请选择修改方式：" 1
+    cecho "$C_CYAN" " 请选择修改方式：" 1
     print_divider
-    echo "  1. 保留当前模式，只修改参数"
+    menu_item "$C_GREEN" "1." "保留当前模式，只修改参数"
     if [ "$current_mode" = reality ]; then
-        echo "  2. 切换为 VLESS Encryption"
+        menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption"
     else
-        echo "  2. 切换为 VLESS Encryption + REALITY + Vision"
+        menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption + REALITY + Vision"
     fi
-    echo "  0. 返回主菜单"
+    menu_item "$C_MAGENTA" "0." "返回主菜单"
     print_divider
-    read -r -p "  请输入选项 [0-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
+    read -r -p " 请输入选项 [0-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in
         0) return ;;
         1) target_mode=$current_mode ;;
@@ -617,12 +642,12 @@ modify_config() {
         *) error "无效选项。"; return 1 ;;
     esac
 
-    read -r -p "  端口（当前 $port，回车保留）：" input || { error "读取端口失败。"; return 2; }; port=${input:-$port}; valid_port "$port" || { error "端口无效。"; return 1; }
+    read -r -p " -> 新端口 (当前: $(prompt_default "$port"), 回车保留): " input || { error "读取端口失败。"; return 2; }; port=${input:-$port}; valid_port "$port" || { error "端口无效。"; return 1; }
     if [ "$port" != "$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)" ] && port_in_use "$port"; then
         error "端口 $port 已被占用，请选择其他端口。"
         return 1
     fi
-    read -r -p "  UUID（当前 $uuid，回车保留）：" input || { error "读取 UUID 失败。"; return 2; }; uuid=${input:-$uuid}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
+    read -r -p " -> 新UUID (当前: $(prompt_default "$uuid"), 回车保留): " input || { error "读取 UUID 失败。"; return 2; }; uuid=${input:-$uuid}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
 
     if [ "$target_mode" = reality ]; then
         if [ "$current_mode" = reality ] && [ -f "$REALITY_INFO" ]; then
@@ -631,8 +656,8 @@ modify_config() {
         else
             sni="www.sega.com"
         fi
-        read -r -p "  REALITY SNI（当前/默认 $sni，回车保留）：" input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
-        read -r -p "  REALITY Short ID（当前/默认 $sid，回车保留）：" input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
+        read -r -p " -> REALITY SNI (当前/默认: $(prompt_default "$sni"), 回车保留): " input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
+        read -r -p " -> REALITY Short ID (当前/默认: $(prompt_default "$sid"), 回车保留): " input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
         # 切换模式或客户端信息缺失时重新生成密钥对
         if [ "$current_mode" != reality ] || [ -z "$private" ] || [ -z "$public" ]; then
             print_step 1 3 "正在生成 REALITY 密钥对..."
@@ -674,10 +699,9 @@ modify_config() {
 
 print_header() {
     clear 2>/dev/null || true
-    cecho "$C_CYAN$C_BOLD" "╭──────────────────────────────────────────────╮" 1
-    cecho "$C_CYAN$C_BOLD" "│        Xray VLESS Unified Installer          │" 1
-    cecho "$C_WHITE$C_BOLD" "│                  ${SCRIPT_VERSION}                    │" 1
-    cecho "$C_CYAN$C_BOLD" "╰──────────────────────────────────────────────╯" 1
+    cecho "$C_CYAN" " Xray VLESS Encryption 管理脚本" 1
+    cecho "$C_YELLOW" " Version: ${SCRIPT_VERSION}" 1
+    print_divider
     xray_status_line
     print_divider
 }
@@ -686,18 +710,18 @@ main_menu() {
     local choice
     while true; do
         print_header
-        echo
-        cecho "$C_GREEN" "  1. 安装 / 重装" 1
-        cecho "$C_GREEN" "  2. 更新 Xray" 1
-        cecho "$C_CYAN" "  3. 重启 Xray" 1
-        cecho "$C_RED" "  4. 卸载 Xray" 1
-        cecho "$C_BLUE" "  5. 查看 Xray 日志" 1
-        cecho "$C_YELLOW" "  6. 修改当前配置" 1
-        cecho "$C_MAGENTA" "  7. 查看订阅信息" 1
+        menu_item "$C_GREEN" "1." "安装 / 重装"
+        menu_item "$C_CYAN" "2." "更新 Xray"
+        menu_item "$C_CYAN" "3." "重启 Xray"
+        menu_item "$C_RED" "4." "卸载 Xray"
         print_divider
-        cecho "$C_RED$C_BOLD" "  0. 退出" 1
+        menu_item "$C_MAGENTA" "5." "查看 Xray 日志"
+        menu_item "$C_YELLOW" "6." "修改当前配置"
+        menu_item "$C_GREEN" "7." "查看订阅信息"
         print_divider
-        read -r -p "  请输入选项 [0-7]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
+        menu_item "$C_YELLOW" "0." "退出"
+        print_divider
+        read -r -p " 请输入选项 [0-7]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
         case "$choice" in
             1) ( interactive_install ) || true ;;
             2)
