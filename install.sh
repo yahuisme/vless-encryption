@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Xray VLESS Encryption unified installer
-# 版本: v26.09.02
+# 版本: v26.09.03
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.02"
+SCRIPT_VERSION="v26.09.03"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -370,16 +370,16 @@ show_subscription() {
     fi
     local sub_tmp; sub_tmp=$(mktemp "${SUBSCRIPTION_INFO}.tmp.XXXXXX"); chmod 600 "$sub_tmp"
     printf '%s\n' "$link" > "$sub_tmp"; mv -f "$sub_tmp" "$SUBSCRIPTION_INFO"
-    echo "----------------------------------------------------------------"
+    print_divider
     cecho "$C_CYAN" " --- VLESS 订阅信息 --- "
     echo " 模式: $([ "$security" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
     echo " 端口: $port"; echo " UUID: $uuid"
     [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; }
-    echo "----------------------------------------------------------------"; cecho "$C_GREEN" " 订阅链接（已保存到 $SUBSCRIPTION_INFO）："; echo; cecho "$C_GREEN" "$link"; echo "----------------------------------------------------------------"
+    print_divider; cecho "$C_GREEN" " 订阅链接（已保存到 $SUBSCRIPTION_INFO）："; echo; cecho "$C_GREEN" "$link"; print_divider
 }
 
 print_step() { cecho "$C_BLUE" "  [$1/$2] $3" 2; }
-print_divider() { cecho "$C_CYAN" "$(printf '%0.s─' {1..48})" 1; }
+print_divider() { cecho "$C_CYAN" "────────────────────────────────────" 1; }
 
 # xray-dual 同款菜单项：彩色编号 + 两列对齐
 menu_item() { # <颜色> <编号> <说明>
