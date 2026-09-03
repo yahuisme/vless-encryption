@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Xray VLESS Encryption unified installer
-# 版本: v26.09.03
+# ==============================================================================
+# Xray VLESS Encryption 极简一键安装脚本
+# 系统支持: Debian 10+ / Ubuntu 20.04+
+# 版本: v26.09.04
+# ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.03"
+SCRIPT_VERSION="v26.09.04"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -785,13 +788,22 @@ main() {
     local port=443 uuid="" sni="" sid=20220701
     while [ "$#" -gt 0 ]; do
         case "$1" in
+            -h|--help)
+                if [ "$#" -ne 1 ]; then
+                    error "选项 $1 不接受多余参数"
+                    show_help
+                    exit 2
+                fi
+                show_help
+                exit 0
+                ;;
             --port|--uuid|--auth|--mode|--sni|--short-id)
                 if [ "$#" -lt 2 ] || [ -z "$2" ] || [[ "$2" = -* ]]; then
                     error "参数 $1 缺少有效值。"
                     exit 2
                 fi
                 case "$1" in --port) port=$2;; --uuid) uuid=$2;; --auth) AUTH_MODE=$2;; --mode) TRAFFIC_MODE=$2;; --sni) sni=$2;; --short-id) sid=$2; REALITY_SHORT_ID_SET=true;; esac; shift 2 ;;
-            *) error "未知参数: $1"; exit 1 ;;
+            *) error "未知参数: $1"; show_help; exit 2 ;;
         esac
     done
     valid_port "$port" || { error "端口无效。"; exit 1; }; valid_auth "$AUTH_MODE" || { error "认证模式无效。"; exit 1; }; valid_appearance "$TRAFFIC_MODE" || { error "外观模式无效。"; exit 1; }
@@ -811,7 +823,24 @@ main() {
 # 兼容 bash <(curl ...)、直接执行与 curl ... | bash 管道方式；
 # ${BASH_SOURCE[0]:-} 兼容 set -u 下管道模式的空数组
 if [ "${BASH_SOURCE[0]:-}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
-    if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then show_help; exit 0; fi
+    if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+        if [ "$#" -ne 1 ]; then
+            error "选项 $1 不接受多余参数"
+            show_help
+            exit 2
+        fi
+        show_help
+        exit 0
+    fi
+    if [ "${1:-}" = install ] && { [ "${2:-}" = --help ] || [ "${2:-}" = -h ]; }; then
+        if [ "$#" -ne 2 ]; then
+            error "选项 $2 不接受多余参数"
+            show_help
+            exit 2
+        fi
+        show_help
+        exit 0
+    fi
     if [ ! -t 0 ] && [ "${1:-}" != install ]; then
         error "交互模式需要 TTY；请使用 install 子命令及非交互参数。"
         exit 2
