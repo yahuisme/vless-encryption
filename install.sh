@@ -143,25 +143,22 @@ run_official_installer() {
     local script_file log_file rc=0
     script_file=$(mktemp)
     log_file=$(mktemp)
-    info "正在准备 Xray 安装程序..."
+    trap 'rm -f -- "${script_file:-}" "${log_file:-}"' RETURN
     if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 "$XRAY_INSTALL_URL" > "$script_file"; then
-        rm -f "$script_file" "$log_file"; error "下载官方 Xray 安装脚本失败。"; return 1
+        error "下载官方 Xray 安装脚本失败。"; return 1
     fi
     if ! printf '%s  %s\n' "$XRAY_INSTALL_SHA256" "$script_file" | sha256sum -c --status; then
-        rm -f "$script_file" "$log_file"; error "官方安装脚本校验失败，已拒绝执行。"; return 1
+        error "官方安装脚本校验失败，已拒绝执行。"; return 1
     fi
     if ! grep -qE '(^#!.*bash|install-release)' "$script_file"; then
-        rm -f "$script_file" "$log_file"; error "官方安装脚本内容校验失败。"; return 1
+        error "官方安装脚本内容校验失败。"; return 1
     fi
     bash "$script_file" "$@" >"$log_file" 2>&1 || rc=$?
-    rm -f "$script_file"
     if [ "$rc" -ne 0 ]; then
         error "官方 Xray 安装程序执行失败，以下为末尾日志："
         tail -n 30 "$log_file" >&2 || true
-        rm -f "$log_file"
         return "$rc"
     fi
-    rm -f "$log_file"
 }
 
 latest_xray_version() {
