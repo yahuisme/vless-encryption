@@ -2,12 +2,12 @@
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
 # 系统支持: Debian 10+ / Ubuntu 20.04+
-# 版本: v26.09.04
+# 版本: v26.09.10
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.04"
+SCRIPT_VERSION="v26.09.10"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -99,7 +99,7 @@ current_port() {
     jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null || true
 }
 
-valid_port() { [[ "$1" =~ ^([1-9][0-9]*|0)$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+valid_port() { [ "${#1}" -le 5 ] && [[ "$1" =~ ^([1-9][0-9]*|0)$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
 valid_sni() {
     local label
     local -a sni_labels
@@ -150,9 +150,14 @@ run_official_installer() {
     if ! printf '%s  %s\n' "$XRAY_INSTALL_SHA256" "$script_file" | sha256sum -c --status; then
         error "官方安装脚本校验失败，已拒绝执行。"; return 1
     fi
-    if ! grep -qE '(^#!.*bash|install-release)' "$script_file"; then
-        error "官方安装脚本内容校验失败。"; return 1
+    # 摘要校验后，仅改写固定源码末尾的停止状态判断；其他 return/exit 原样保留。
+    local source_text stopped_tail
+    source_text=$(<"$script_file")
+    stopped_tail=$'    [[ "$XRAY_RUNNING" -eq \'1\' ]] && start_xray\n  else\n'
+    if [[ $source_text != *"$stopped_tail"* || ${source_text#*"$stopped_tail"} == *"$stopped_tail"* ]]; then
+        error "官方安装脚本末尾语义不匹配，已拒绝执行。"; return 1
     fi
+    printf '%s\n' "${source_text/"$stopped_tail"/$'    if [[ "$XRAY_RUNNING" -eq \'1\' ]]; then start_xray; fi\n  else\n'}" > "$script_file" || return 1
     bash "$script_file" "$@" >"$log_file" 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
         error "官方 Xray 安装程序执行失败，以下为末尾日志："
@@ -262,32 +267,76 @@ generate_reality_keys() {
 
 write_config() {
     local port="$1" uuid="$2" decryption="$3" encryption="$4" mode="$5" private="${6:-}" public="${7:-}" sni="${8:-}" short_id="${9:-}"
-    local tmp account user group enc_tmp reality_tmp test_log
+    local tmp account user group enc_tmp reality_tmp test_log snapshot merged
+    local preserve="${10:-false}"
+    validate_encryption_token "$encryption" 0rtt || return 1
+    if [ "$mode" = reality ]; then
+        validate_reality_key "$private" && validate_reality_key "$public" && valid_sni "$sni" && valid_short_id "$short_id" || return 1
+    fi
     account=$(service_account) || { error "无法确定 Xray systemd 服务账户。"; return 1; }
     user=${account%%:*}; group=${account#*:}
-    install -d -m 0755 "$(dirname "$XRAY_CONFIG")"
-    tmp=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json")
-    chmod 600 "$tmp"
+    install -d -m 0755 "$(dirname "$XRAY_CONFIG")" || return 1
+    tmp=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     if [ "$mode" = reality ]; then
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" --arg private "$private" --arg sni "$sni" --arg sid "$short_id" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp"
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     else
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp"
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
-    test_log=$(mktemp)
-    chmod 600 "$test_log"
+    if [ "$preserve" = true ]; then
+        merged=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || { rm -f "$tmp"; return 1; }
+        # Only update owned parameters; preserve listeners, clients and user extensions.
+        if ! jq --slurpfile new "$tmp" '
+          .inbounds[0] |= (
+            .port = $new[0].inbounds[0].port |
+            .settings.decryption = $new[0].inbounds[0].settings.decryption |
+            .settings.clients[0].id = $new[0].inbounds[0].settings.clients[0].id |
+            if $new[0].inbounds[0].streamSettings.security == "reality" then
+              if .streamSettings.security == "reality" then
+                .streamSettings.realitySettings |= (
+                  if .serverNames[0] != $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0] then
+                    .dest = $new[0].inbounds[0].streamSettings.realitySettings.dest |
+                    .serverNames[0] = $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0]
+                  else . end |
+                  .shortIds[0] = $new[0].inbounds[0].streamSettings.realitySettings.shortIds[0])
+              else
+                .streamSettings = ((.streamSettings // {}) * $new[0].inbounds[0].streamSettings)
+              end
+            else
+              if .streamSettings.security == "reality" then
+                .streamSettings |= (del(.realitySettings) | .security = "none")
+              else . end
+            end)' "$XRAY_CONFIG" > "$merged"; then
+            rm -f "$tmp" "$merged"; return 1
+        fi
+        mv -f "$merged" "$tmp" || { rm -f "$tmp" "$merged"; return 1; }
+    fi
+    test_log=$(mktemp) || { rm -f "$tmp"; return 1; }
+    chmod 600 "$test_log" || { rm -f "$tmp" "$test_log"; return 1; }
     if ! "$XRAY_BIN" run -test -config "$tmp" >"$test_log" 2>&1; then
         error "Xray 配置校验失败，未替换现有配置。"; sed -n '1,40p' "$test_log" >&2 || true; rm -f "$tmp" "$test_log"; return 1
     fi
     rm -f "$test_log"
-    ROLLBACK_DIR=$(mktemp -d /tmp/xray-rollback.XXXXXX); chmod 700 "$ROLLBACK_DIR"
-    [ ! -f "$XRAY_CONFIG" ] || cp -p "$XRAY_CONFIG" "$ROLLBACK_DIR/config.json"
-    [ ! -f "$ENCRYPTION_INFO" ] || cp -p "$ENCRYPTION_INFO" "$ROLLBACK_DIR/encryption.info"
-    [ ! -f "$REALITY_INFO" ] || cp -p "$REALITY_INFO" "$ROLLBACK_DIR/reality.info"
-    enc_tmp=$(mktemp "${ENCRYPTION_INFO}.tmp.XXXXXX"); chmod 600 "$enc_tmp"; printf '%s\n' "$encryption" > "$enc_tmp"
+    snapshot=$(mktemp -d /tmp/xray-rollback.XXXXXX) || { rm -f "$tmp"; return 1; }
+    if ! chmod 700 "$snapshot" ||
+       ! { [ ! -f "$XRAY_CONFIG" ] || cp -p "$XRAY_CONFIG" "$snapshot/config.json"; } ||
+       ! { [ ! -f "$ENCRYPTION_INFO" ] || cp -p "$ENCRYPTION_INFO" "$snapshot/encryption.info"; } ||
+       ! { [ ! -f "$REALITY_INFO" ] || cp -p "$REALITY_INFO" "$snapshot/reality.info"; }; then
+        rm -rf "$snapshot"; rm -f "$tmp"
+        error "无法创建配置快照，未替换现有配置。"; return 1
+    fi
+    ROLLBACK_DIR="$snapshot"
+    enc_tmp=$(mktemp "${ENCRYPTION_INFO}.tmp.XXXXXX") || { rm -f "$tmp"; return 1; }
+    if ! chmod 600 "$enc_tmp" || ! printf '%s\n' "$encryption" > "$enc_tmp"; then
+        rm -f "$tmp" "$enc_tmp"; return 1
+    fi
     if [ "$mode" = reality ]; then
-        reality_tmp=$(mktemp "${REALITY_INFO}.tmp.XXXXXX"); chmod 600 "$reality_tmp"; printf '%s|%s|%s\n' "$public" "$sni" "$short_id" > "$reality_tmp"
+        reality_tmp=$(mktemp "${REALITY_INFO}.tmp.XXXXXX") || { rm -f "$tmp" "$enc_tmp"; return 1; }
+        if ! chmod 600 "$reality_tmp" || ! printf '%s|%s|%s\n' "$public" "$sni" "$short_id" > "$reality_tmp"; then
+            rm -f "$tmp" "$enc_tmp" "$reality_tmp"; return 1
+        fi
     else
         reality_tmp=""
     fi
@@ -316,6 +365,35 @@ write_config() {
     fi
 }
 
+valid_ipv6() {
+    local ip="$1" part tail left right count=0 octet
+    local -a parts octets
+    if [[ "$ip" == *.* ]]; then
+        tail=${ip##*:}
+        IFS=. read -r -a octets <<< "$tail"
+        [ "${#octets[@]}" = 4 ] || return 1
+        for octet in "${octets[@]}"; do
+            [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$octet" -le 255 ] || return 1
+        done
+        ip=${ip%:*}:0:0
+    fi
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" != *:::* ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        left=${ip%%::*}; right=${ip#*::}
+        [[ "$right" != *::* ]] || return 1
+        ip=${left:+$left:}$right
+    else
+        [[ "$ip" != :* && "$ip" != *: ]] || return 1
+        left=full
+    fi
+    IFS=: read -r -a parts <<< "$ip"
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        count=$((count + 1))
+    done
+    if [ "$left" = full ]; then [ "$count" = 8 ]; else [ "$count" -lt 8 ]; fi
+}
+
 public_ip() {
     local ip valid octet cache_file="/usr/local/etc/xray/.public-ip"
     local -a ip_octets
@@ -338,7 +416,7 @@ public_ip() {
     done
     for endpoint in https://api-ipv6.ip.sb/ip https://api64.ipify.org; do
         ip=$(curl -6fs --max-time 5 "$endpoint" 2>/dev/null || true)
-        if [[ "$ip" =~ ^[0-9A-Fa-f:]+$ && "$ip" == *:* ]]; then
+        if valid_ipv6 "$ip"; then
             printf '[%s]\n' "$ip" > "$cache_file" 2>/dev/null || true
             printf '[%s]\n' "$ip"; return
         fi
@@ -361,18 +439,25 @@ show_subscription() {
     security=$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG")
     if [ "$security" = reality ]; then
         [ -f "$REALITY_INFO" ] || { error "缺少 REALITY 客户端信息。"; return 1; }
-        IFS='|' read -r public sni sid < "$REALITY_INFO"
+        IFS='|' read -r public sni sid < "$REALITY_INFO" || return 1
+        if ! validate_reality_key "$public" || ! valid_sni "$sni" || ! valid_short_id "$sid"; then
+            error "REALITY 客户端信息无效，请先修改配置修复。"; return 1
+        fi
         title="$(hostname) VLESS-E-REALITY"
         link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")&security=reality&sni=$(uri_encode "$sni")&sid=$(uri_encode "$sid")&fp=chrome&pbk=$(uri_encode "$public")&flow=xtls-rprx-vision&type=tcp#$(uri_encode "$title")"
     else
         title="$(hostname) VLESS-E"
         link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")&flow=xtls-rprx-vision&type=tcp&security=none#$(uri_encode "$title")"
     fi
-    local sub_tmp; sub_tmp=$(mktemp "${SUBSCRIPTION_INFO}.tmp.XXXXXX"); chmod 600 "$sub_tmp"
-    printf '%s\n' "$link" > "$sub_tmp"; mv -f "$sub_tmp" "$SUBSCRIPTION_INFO"
+    local sub_tmp
+    sub_tmp=$(mktemp "${SUBSCRIPTION_INFO}.tmp.XXXXXX") || return 1
+    if ! chmod 600 "$sub_tmp" || ! printf '%s\n' "$link" > "$sub_tmp" || ! mv -f "$sub_tmp" "$SUBSCRIPTION_INFO"; then
+        rm -f "$sub_tmp"
+        error "保存订阅链接失败。"; return 1
+    fi
     print_divider
     cecho "$C_CYAN" " --- VLESS 订阅信息 --- "
-    echo " 模式: $([ "$security" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
+    echo " 模式: $([ "$security" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
     echo " 端口: $port"; echo " UUID: $uuid"
     [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; }
     print_divider; cecho "$C_GREEN" " 订阅链接（已保存到 $SUBSCRIPTION_INFO）："; echo; cecho "$C_GREEN" "$link"; print_divider
@@ -393,7 +478,7 @@ menu_item() { # <颜色> <编号> <说明>
 
 # 带颜色的默认值文本（NO_COLOR/非 tty 时纯文本，供 read -p 使用）
 prompt_default() {
-    if color_enabled 1; then printf '%b%s%b' "$C_CYAN" "$1" "$C_RESET"; else printf '%s' "$1"; fi
+    if color_enabled 2; then printf '%b%s%b' "$C_CYAN" "$1" "$C_RESET"; else printf '%s' "$1"; fi
 }
 
 xray_status_line() {
@@ -411,7 +496,7 @@ xray_status_line() {
         state_text="未运行"; state_color="$C_YELLOW"
     fi
     if [ -f "$XRAY_CONFIG" ] && [ "$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG" 2>/dev/null)" = reality ]; then
-        mode="VLESS Encryption + REALITY + Vision"
+        mode="VLESS-E + REALITY"
     else
         mode="VLESS Encryption"
     fi
@@ -441,17 +526,20 @@ uninstall_xray() {
     else
         info "Xray 二进制与服务不存在，跳过官方卸载，仅清理残留。"
     fi
-    print_step 2 3 "正在清除客户端信息..."
-    rm -f "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"
+    print_step 2 3 "正在清除配置和客户端信息..."
+    if ! rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray ||
+       ! rm -f "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"; then
+        error "残留文件清理失败，保留本脚本以便重试。"; return 1
+    fi
     print_step 3 3 "正在确认卸载结果..."
     if [ -e "$XRAY_BIN" ] || systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
         error "仍检测到 Xray 文件或服务，请使用菜单 5 查看日志。"
         return 1
     fi
     # 官方 --purge 不会删除本脚本及脚本生成在 /root 下的文件。
-    rm -f "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"
-    rm -rf /tmp/xray-rollback.* /tmp/xray-install-rollback.* 2>/dev/null || true
-    if [ -f "${0:-}" ]; then rm -f -- "$0" || true; fi
+    if [ -f "${0:-}" ] && ! rm -f -- "$0"; then
+        error "本脚本删除失败，请手动删除 $0"; return 1
+    fi
     success "Xray、配置、客户端信息及本脚本已清除。"
 }
 
@@ -463,17 +551,16 @@ rollback_config() {
     if [ -f "$ROLLBACK_DIR/encryption.info" ]; then cp -p "$ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
     if [ -f "$ROLLBACK_DIR/reality.info" ]; then cp -p "$ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
     if [ -f "$XRAY_CONFIG" ] && ! "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then failed=true; fi
-    rm -rf "$ROLLBACK_DIR" || failed=true
-    ROLLBACK_DIR=""
     if [ "$failed" = true ]; then
-        error "配置回滚失败，请立即检查并手动恢复 Xray 配置。"
+        error "配置回滚失败，请手动恢复；快照保留在 $ROLLBACK_DIR"
         return 1
     fi
+    clear_rollback || return 1
     success "配置回滚完成。"
 }
-clear_rollback() { [ -z "$ROLLBACK_DIR" ] || { rm -rf "$ROLLBACK_DIR"; ROLLBACK_DIR=""; }; }
+clear_rollback() { [ -z "$ROLLBACK_DIR" ] || { rm -rf "$ROLLBACK_DIR" || return 1; ROLLBACK_DIR=""; }; }
 begin_install_snapshot() {
-    local dir
+    local dir geo
     dir=$(mktemp -d /tmp/xray-install-rollback.XXXXXX) || return 1
     if ! chmod 700 "$dir" ||
        ! { [ ! -e "$XRAY_BIN" ] || cp -p "$XRAY_BIN" "$dir/xray"; } ||
@@ -483,57 +570,77 @@ begin_install_snapshot() {
         rm -rf "$dir"
         return 1
     fi
+    for geo in geoip.dat geosite.dat; do
+        if [ -f "/usr/local/share/xray/$geo" ] && ! cp -p "/usr/local/share/xray/$geo" "$dir/$geo"; then
+            rm -rf "$dir"; return 1
+        fi
+    done
+    if systemctl is-active --quiet xray; then
+        touch "$dir/was-active" || { rm -rf "$dir"; return 1; }
+    fi
+    if [ -f /etc/systemd/system/xray.service ]; then
+        cp -p /etc/systemd/system/xray.service "$dir/xray.service" || { rm -rf "$dir"; return 1; }
+    fi
     INSTALL_ROLLBACK_DIR="$dir"
 }
 restore_install_snapshot() {
     if [ -z "$INSTALL_ROLLBACK_DIR" ] || [ ! -d "$INSTALL_ROLLBACK_DIR" ]; then return 0; fi
     error "正在恢复安装前的配置和 Xray 核心..."
-    local failed=false
+    local failed=false geo
+    if ! systemctl stop xray; then
+        error "停止 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+    fi
     if [ -f "$INSTALL_ROLLBACK_DIR/xray" ]; then cp -p "$INSTALL_ROLLBACK_DIR/xray" "$XRAY_BIN" || failed=true; else rm -f "$XRAY_BIN" || failed=true; fi
     if [ -f "$INSTALL_ROLLBACK_DIR/config.json" ]; then cp -p "$INSTALL_ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
     if [ -f "$INSTALL_ROLLBACK_DIR/encryption.info" ]; then cp -p "$INSTALL_ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
     if [ -f "$INSTALL_ROLLBACK_DIR/reality.info" ]; then cp -p "$INSTALL_ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
-    rm -rf "$INSTALL_ROLLBACK_DIR" || failed=true
-    INSTALL_ROLLBACK_DIR=""
-    if [ "$failed" = true ]; then error "安装回滚失败，请立即检查并手动恢复 Xray。"; return 1; fi
+    for geo in geoip.dat geosite.dat; do
+        if [ -f "$INSTALL_ROLLBACK_DIR/$geo" ]; then
+            cp -p "$INSTALL_ROLLBACK_DIR/$geo" "/usr/local/share/xray/$geo" || failed=true
+        else
+            rm -f "/usr/local/share/xray/$geo" || failed=true
+        fi
+    done
+    if [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ]; then
+        cp -p "$INSTALL_ROLLBACK_DIR/xray.service" /etc/systemd/system/xray.service || failed=true
+    elif [ ! -f "$INSTALL_ROLLBACK_DIR/xray" ]; then
+        if systemctl disable --now xray; then
+            rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service || failed=true
+        else failed=true; fi
+    fi
+    systemctl daemon-reload || failed=true
+    if [ "$failed" = false ] && [ -f "$INSTALL_ROLLBACK_DIR/was-active" ] && [ -x "$INSTALL_ROLLBACK_DIR/xray" ]; then
+        restart_xray || failed=true
+    fi
+    if [ "$failed" = true ]; then
+        error "安装回滚失败，请手动恢复；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+    fi
+    clear_install_snapshot || return 1
     success "安装回滚完成。"
 }
-clear_install_snapshot() { [ -z "$INSTALL_ROLLBACK_DIR" ] || { rm -rf "$INSTALL_ROLLBACK_DIR"; INSTALL_ROLLBACK_DIR=""; }; }
-# 全新安装失败时撤销官方安装器 enable 的服务（快照中无旧二进制 = 本次全新安装）
-disable_fresh_service() {
-    if [ -n "$INSTALL_ROLLBACK_DIR" ] && [ ! -e "$INSTALL_ROLLBACK_DIR/xray" ]; then
-        systemctl disable --now xray 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-    fi
-}
+clear_install_snapshot() { [ -z "$INSTALL_ROLLBACK_DIR" ] || { rm -rf "$INSTALL_ROLLBACK_DIR" || return 1; INSTALL_ROLLBACK_DIR=""; }; }
 update_xray() {
+    [ -f /etc/systemd/system/xray.service ] || { error "主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1; }
     begin_install_snapshot || { error "无法创建更新回滚快照。"; return 1; }
     # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
     # install-geodata 重复；统一由 install-geodata 负责。
-    if ! run_official_installer install --without-geodata; then
+    if ! run_official_installer install --without-geodata --no-update-service; then
         error "Xray 更新失败，正在回滚。"
     elif ! run_official_installer install-geodata; then
         error "GeoIP/GeoSite 更新失败，正在回滚。"
-    elif ! restart_xray; then
-        error "Xray 重启失败，正在回滚。"
+    elif ! { if [ -f "$INSTALL_ROLLBACK_DIR/was-active" ]; then restart_xray; else systemctl stop xray; fi; }; then
+        error "恢复 Xray 运行状态失败，正在回滚。"
     else
         clear_install_snapshot
         success "Xray 更新完成。"
         return 0
     fi
-    restore_install_snapshot || true
-    if ! restart_xray; then
-        error "回滚后 Xray 仍未运行，请立即检查服务和配置。"
-    else
-        info "已恢复更新前的 Xray 核心。"
-    fi
+    restore_install_snapshot || return 1
     return 1
 }
 abort_install() {
-    disable_fresh_service
-    restore_install_snapshot || true
+    restore_install_snapshot || return 1
     clear_rollback
-    systemctl restart xray 2>/dev/null || true
     return 1
 }
 uri_encode() { jq -nr --arg value "$1" '$value | @uri'; }
@@ -548,14 +655,30 @@ restart_xray() {
 
 install_selected() {
     local port="$1" uuid="$2" mode="$3" sni="${4:-}" sid="${5:-}" pair dec enc keys private public
+    local total=4 path
+    local -a service_args=()
+    [ "$mode" != reality ] || total=5
+    if [ -f /etc/systemd/system/xray.service ]; then
+        service_args=(--no-update-service)
+    else
+        # 官方在主 unit 缺失时忽略 --no-update-service；拒绝覆盖残留服务定义。
+        for path in "$XRAY_BIN" "$XRAY_CONFIG" \
+            /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+            /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d \
+            /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                error "检测到既有安装但主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1
+            fi
+        done
+    fi
     begin_install_snapshot || { error "无法创建安装回滚快照。"; return 1; }
-    print_step 1 5 "正在安装 / 更新 Xray 核心..."
+    print_step 1 "$total" "正在安装 / 更新 Xray 核心..."
     # --without-geodata: 官方 install 默认已含 geodata 下载，与下方
     # install-geodata 重复；统一由 install-geodata 负责。
-    run_official_installer install --without-geodata || { error "Xray 核心安装失败。"; abort_install; return 1; }
-    print_step 2 5 "正在更新 GeoIP 和 GeoSite 数据..."
+    run_official_installer install --without-geodata "${service_args[@]}" || { error "Xray 核心安装失败。"; abort_install; return 1; }
+    print_step 2 "$total" "正在更新 GeoIP 和 GeoSite 数据..."
     run_official_installer install-geodata || { error "Geo 数据更新失败。"; abort_install; return 1; }
-    print_step 3 5 "正在生成 VLESS Encryption 密钥材料..."
+    print_step 3 "$total" "正在生成 VLESS Encryption 密钥材料..."
     xray_supports || { error "已安装的 Xray 不支持 VLESS Encryption。"; abort_install; return 1; }
     pair=$(generate_encryption_pair) || { abort_install; return 1; }; IFS='|' read -r dec enc <<< "$pair"
     if [ "$mode" = reality ]; then
@@ -564,22 +687,16 @@ install_selected() {
         print_step 5 5 "正在写入并校验 REALITY 配置..."
         write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid" || { abort_install; return 1; }
     else
-        print_step 4 5 "正在准备 VLESS Encryption 配置..."
-        print_step 5 5 "正在写入并校验配置..."
+        print_step 4 "$total" "正在写入并校验配置..."
         write_config "$port" "$uuid" "$dec" "$enc" encryption || { abort_install; return 1; }
     fi
     if ! restart_xray; then
-        disable_fresh_service
-        restore_install_snapshot || true
-        clear_rollback
-        if ! restart_xray; then
-            error "回滚后 Xray 仍未运行，请立即检查服务和配置。"
-        fi
+        abort_install || return 1
         return 1
     fi
     clear_install_snapshot
     clear_rollback
-    success "安装完成：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')。"
+    success "安装完成：$([ "$mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')。"
     show_subscription || info "Xray 已安装并运行，但暂时无法生成订阅链接。"
     return 0
 }
@@ -589,7 +706,7 @@ interactive_install() {
     echo
     section_title "请选择安装模式（每次只能安装一种）"
     menu_item "$C_GREEN" "1." "VLESS Encryption"
-    menu_item "$C_YELLOW" "2." "VLESS Encryption + REALITY + Vision"
+    menu_item "$C_YELLOW" "2." "VLESS-E + REALITY"
     print_divider
     read -r -p " 请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in 1) mode=encryption;; 2) mode=reality;; *) error "无效选项。"; return 1;; esac
@@ -604,12 +721,13 @@ interactive_install() {
         read -r -p " -> 请输入REALITY Short ID (默认: $(prompt_default 20220701)): " sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
     fi
     print_divider
-    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
+    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$mode" "$sni" "$sid"
 }
 
 modify_config() {
-    local current_mode target_mode choice port uuid sni="" sid="20220701" dec enc private public pair keys input
+    local current_mode target_mode choice port uuid sni="" sid="20220701" dec enc private="" public="" pair keys input
+    local step=0 total=1
     if [ ! -f "$XRAY_CONFIG" ] || [ ! -f "$ENCRYPTION_INFO" ]; then
         error "未检测到可修改的 Xray 配置。"
         return 1
@@ -621,14 +739,14 @@ modify_config() {
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
 
     echo
-    section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
+    section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
     cecho "$C_CYAN" " 请选择修改方式：" 1
     print_divider
     menu_item "$C_GREEN" "1." "保留当前模式，只修改参数"
     if [ "$current_mode" = reality ]; then
         menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption"
     else
-        menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption + REALITY + Vision"
+        menu_item "$C_YELLOW" "2." "切换为 VLESS-E + REALITY"
     fi
     menu_item "$C_MAGENTA" "0." "返回主菜单"
     print_divider
@@ -649,18 +767,27 @@ modify_config() {
     fi
     read -r -p " -> 新UUID (当前: $(prompt_default "$uuid"), 回车保留): " input || { error "读取 UUID 失败。"; return 2; }; uuid=${input:-$uuid}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
 
+    if [ "$target_mode" != "$current_mode" ]; then
+        total=2
+        [ "$target_mode" != reality ] || total=3
+    fi
     if [ "$target_mode" = reality ]; then
-        if [ "$current_mode" = reality ] && [ -f "$REALITY_INFO" ]; then
-            IFS='|' read -r public sni sid < "$REALITY_INFO"
-            private=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$XRAY_CONFIG")
+        if [ "$current_mode" = reality ]; then
+            private=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // empty' "$XRAY_CONFIG")
+            sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // empty' "$XRAY_CONFIG")
+            sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0] // empty' "$XRAY_CONFIG")
+            validate_reality_key "$private" || { error "现有 REALITY 私钥无效，未修改配置。"; return 1; }
+            keys=$("$XRAY_BIN" x25519 -i "$private") || return 1
+            public=$(awk '/^(Password|PublicKey:|Public key:)/ {print $NF; exit}' <<< "$keys")
+            validate_reality_key "$public" || { error "无法推导 REALITY 公钥。"; return 1; }
         else
             sni="www.sega.com"
         fi
         read -r -p " -> REALITY SNI (当前/默认: $(prompt_default "$sni"), 回车保留): " input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
         read -r -p " -> REALITY Short ID (当前/默认: $(prompt_default "$sid"), 回车保留): " input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
-        # 切换模式或客户端信息缺失时重新生成密钥对
-        if [ "$current_mode" != reality ] || [ -z "$private" ] || [ -z "$public" ]; then
-            print_step 1 3 "正在生成 REALITY 密钥对..."
+        # 仅切换到 REALITY 时生成新密钥；保留模式从现有私钥推导。
+        if [ "$current_mode" != reality ]; then
+            step=$((step + 1)); print_step "$step" "$total" "正在生成 REALITY 密钥对..."
             keys=$(generate_reality_keys) || return 1
             IFS='|' read -r private public <<< "$keys"
         fi
@@ -670,17 +797,17 @@ modify_config() {
         dec=$(jq -r '.inbounds[0].settings.decryption' "$XRAY_CONFIG")
         enc=$(<"$ENCRYPTION_INFO")
     else
-        print_step 2 3 "正在生成 $([ "$target_mode" = reality ] && echo 'REALITY 模式' || echo 'Encryption 模式') 密钥材料..."
+        step=$((step + 1)); print_step "$step" "$total" "正在生成 $([ "$target_mode" = reality ] && echo 'REALITY 模式' || echo 'Encryption 模式') 密钥材料..."
         pair=$(generate_encryption_pair) || return 1
         IFS='|' read -r dec enc <<< "$pair"
     fi
-    print_step 3 3 "正在写入并校验新配置..."
+    step=$((step + 1)); print_step "$step" "$total" "正在写入并校验新配置..."
     if [ "$target_mode" = reality ]; then
-        if ! write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid"; then
+        if ! write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid" true; then
             error "配置写入失败，未修改当前配置。"
             return 1
         fi
-    elif ! write_config "$port" "$uuid" "$dec" "$enc" encryption; then
+    elif ! write_config "$port" "$uuid" "$dec" "$enc" encryption "" "" "" "" true; then
         error "配置写入失败，未修改当前配置。"
         return 1
     fi
@@ -693,7 +820,7 @@ modify_config() {
         return 1
     fi
     clear_rollback
-    success "配置已更新为 $([ "$target_mode" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')。"
+    success "配置已更新为 $([ "$target_mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')。"
     show_subscription
 }
 
@@ -761,7 +888,7 @@ Xray VLESS Unified Installer ${SCRIPT_VERSION}
 
 无交互模式选择（两者只能安装一个）：
   不带 --sni：VLESS Encryption
-  带 --sni： VLESS Encryption + REALITY + Vision
+  带 --sni： VLESS-E + REALITY
 
 选项：
   --port <端口>       监听端口（默认：443）
@@ -779,8 +906,9 @@ EOF
 }
 
 main() {
+    if [ "$#" -gt 0 ] && [ "$1" != install ]; then error "未知参数: $1"; return 2; fi
     require_root_and_dependencies
-    if [ "${1:-}" != install ]; then main_menu; return; fi
+    if [ "$#" -eq 0 ]; then main_menu; return; fi
     shift
     local port=443 uuid="" sni="" sid=20220701
     while [ "$#" -gt 0 ]; do
@@ -813,7 +941,7 @@ main() {
         error "端口 $port 已被占用，请选择其他端口。"
         exit 1
     fi
-    info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS Encryption + REALITY + Vision' || echo 'VLESS Encryption')"
+    info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$INSTALL_MODE" "$sni" "$sid"
 }
 
@@ -837,6 +965,9 @@ if [ "${BASH_SOURCE[0]:-}" = "$0" ] || [ -z "${BASH_SOURCE[0]:-}" ]; then
         fi
         show_help
         exit 0
+    fi
+    if [ "$#" -gt 0 ] && [ "$1" != install ]; then
+        error "未知参数: $1"; exit 2
     fi
     if [ ! -t 0 ] && [ "${1:-}" != install ]; then
         error "交互模式需要 TTY；请使用 install 子命令及非交互参数。"
