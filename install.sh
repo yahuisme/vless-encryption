@@ -2,12 +2,12 @@
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
 # 系统支持: Debian 10+ / Ubuntu 20.04+
-# 版本: v26.09.10
+# 版本: v26.09.11
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.10"
+SCRIPT_VERSION="v26.09.11"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -409,7 +409,7 @@ public_ip() {
             IFS='.' read -r -a ip_octets <<< "$ip"
             for octet in "${ip_octets[@]}"; do [ "$octet" -le 255 ] || valid=false; done
             if [ "$valid" = true ]; then
-                printf '%s\n' "$ip" > "$cache_file" 2>/dev/null || true
+                { [[ -d "${cache_file%/*}" ]] && printf '%s\n' "$ip" 2>/dev/null > "$cache_file"; } || true
                 printf '%s\n' "$ip"; return
             fi
         fi
@@ -417,7 +417,7 @@ public_ip() {
     for endpoint in https://api-ipv6.ip.sb/ip https://api64.ipify.org; do
         ip=$(curl -6fs --max-time 5 "$endpoint" 2>/dev/null || true)
         if valid_ipv6 "$ip"; then
-            printf '[%s]\n' "$ip" > "$cache_file" 2>/dev/null || true
+            { [[ -d "${cache_file%/*}" ]] && printf '[%s]\n' "$ip" 2>/dev/null > "$cache_file"; } || true
             printf '[%s]\n' "$ip"; return
         fi
     done
@@ -457,9 +457,12 @@ show_subscription() {
     fi
     print_divider
     cecho "$C_CYAN" " --- VLESS 订阅信息 --- "
-    echo " 模式: $([ "$security" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
-    echo " 端口: $port"; echo " UUID: $uuid"
-    [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; }
+    echo " 模式: $([ "$security" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
+    echo " 地址: $address"; echo " 端口: $port"; echo " UUID: $uuid"
+    echo " 传输: tcp | 安全: $security"
+    echo " 流控: xtls-rprx-vision"
+    echo " 客户端 encryption: $encryption"
+    [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; echo " 指纹: chrome"; }
     print_divider; cecho "$C_GREEN" " 订阅链接（已保存到 $SUBSCRIPTION_INFO）："; echo; cecho "$C_GREEN" "$link"; print_divider
 }
 
@@ -496,7 +499,7 @@ xray_status_line() {
         state_text="未运行"; state_color="$C_YELLOW"
     fi
     if [ -f "$XRAY_CONFIG" ] && [ "$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG" 2>/dev/null)" = reality ]; then
-        mode="VLESS-E + REALITY"
+        mode="VLESS Encryption + REALITY"
     else
         mode="VLESS Encryption"
     fi
@@ -517,7 +520,7 @@ uninstall_xray() {
     fi
     echo
     cecho "$C_YELLOW" "  即将卸载 Xray，并使用官方 --purge 清除 Xray 的全部配置和文件。"
-    cecho "$C_YELLOW" "  这不仅限于本脚本生成的文件，操作不可恢复。"
+    cecho "$C_YELLOW" "  这不仅限于本脚本生成的文件；成功后还会删除本脚本，操作不可恢复。"
     read -r -p "  确定继续？[y/N]: " confirm || { error "读取确认失败，已取消卸载。"; return 2; }
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then info "已取消卸载。"; return 0; fi
     print_step 1 3 "正在停止并卸载 Xray..."
@@ -696,7 +699,7 @@ install_selected() {
     fi
     clear_install_snapshot
     clear_rollback
-    success "安装完成：$([ "$mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')。"
+    success "安装完成：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')。"
     show_subscription || info "Xray 已安装并运行，但暂时无法生成订阅链接。"
     return 0
 }
@@ -705,8 +708,11 @@ interactive_install() {
     local choice port uuid sni="" sid="20220701" mode
     echo
     section_title "请选择安装模式（每次只能安装一种）"
+    info "安装 / 重装会覆盖 Xray 配置；两种模式均使用 Vision (xtls-rprx-vision)。"
+    info "客户端须支持 VLESS Encryption 及 encryption 参数；仅支持普通 VLESS/REALITY 的客户端不适用。"
+    info "认证: ${AUTH_MODE}；流量外观: ${TRAFFIC_MODE}（可用 install --auth / --mode 指定）。"
     menu_item "$C_GREEN" "1." "VLESS Encryption"
-    menu_item "$C_YELLOW" "2." "VLESS-E + REALITY"
+    menu_item "$C_YELLOW" "2." "VLESS Encryption + REALITY"
     print_divider
     read -r -p " 请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in 1) mode=encryption;; 2) mode=reality;; *) error "无效选项。"; return 1;; esac
@@ -718,10 +724,10 @@ interactive_install() {
     read -r -p " -> 请输入UUID (留空将自动生成): " uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
     if [ "$mode" = reality ]; then
         read -r -p " -> 请输入REALITY SNI域名 (默认: $(prompt_default www.sega.com)): " sni || { error "读取 SNI 失败。"; return 2; }; sni=${sni:-www.sega.com}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
-        read -r -p " -> 请输入REALITY Short ID (默认: $(prompt_default 20220701)): " sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
+        read -r -p " -> 请输入REALITY Short ID [2-16 位偶数长度十六进制] (默认: $(prompt_default 20220701)): " sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
     fi
     print_divider
-    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
+    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$mode" "$sni" "$sid"
 }
 
@@ -739,14 +745,14 @@ modify_config() {
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
 
     echo
-    section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
+    section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
     cecho "$C_CYAN" " 请选择修改方式：" 1
     print_divider
     menu_item "$C_GREEN" "1." "保留当前模式，只修改参数"
     if [ "$current_mode" = reality ]; then
         menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption"
     else
-        menu_item "$C_YELLOW" "2." "切换为 VLESS-E + REALITY"
+        menu_item "$C_YELLOW" "2." "切换为 VLESS Encryption + REALITY"
     fi
     menu_item "$C_MAGENTA" "0." "返回主菜单"
     print_divider
@@ -784,7 +790,7 @@ modify_config() {
             sni="www.sega.com"
         fi
         read -r -p " -> REALITY SNI (当前/默认: $(prompt_default "$sni"), 回车保留): " input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
-        read -r -p " -> REALITY Short ID (当前/默认: $(prompt_default "$sid"), 回车保留): " input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
+        read -r -p " -> REALITY Short ID [2-16 位偶数长度十六进制] (当前/默认: $(prompt_default "$sid"), 回车保留): " input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
         # 仅切换到 REALITY 时生成新密钥；保留模式从现有私钥推导。
         if [ "$current_mode" != reality ]; then
             step=$((step + 1)); print_step "$step" "$total" "正在生成 REALITY 密钥对..."
@@ -820,7 +826,7 @@ modify_config() {
         return 1
     fi
     clear_rollback
-    success "配置已更新为 $([ "$target_mode" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')。"
+    success "配置已更新为 $([ "$target_mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')。"
     show_subscription
 }
 
@@ -888,15 +894,19 @@ Xray VLESS Unified Installer ${SCRIPT_VERSION}
 
 无交互模式选择（两者只能安装一个）：
   不带 --sni：VLESS Encryption
-  带 --sni： VLESS-E + REALITY
+  带 --sni： VLESS Encryption + REALITY
 
 选项：
   --port <端口>       监听端口（默认：443）
   --uuid <UUID>       UUID（默认：自动生成）
-  --auth <模式>       mlkem768 或 x25519（默认：mlkem768）
-  --mode <模式>       native、xorpub 或 random（默认：native）
+  --auth <认证模式>   mlkem768（ML-KEM-768，后量子认证）或 x25519（非后量子认证）
+                      默认：mlkem768
+  --mode <流量外观>   native、xorpub 或 random（默认：native）
   --sni <域名>        启用 REALITY + Vision；该模式必填
-  --short-id <ID>     REALITY Short ID（默认：20220701）
+  --short-id <ID>     REALITY Short ID：2-16 位偶数长度十六进制（默认：20220701）
+  -h, --help         显示帮助
+
+两种模式均使用 Vision（xtls-rprx-vision）；客户端须支持 VLESS Encryption 及 encryption 参数。
 
 示例：
   $0 install --port 12345
@@ -941,7 +951,7 @@ main() {
         error "端口 $port 已被占用，请选择其他端口。"
         exit 1
     fi
-    info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS-E + REALITY' || echo 'VLESS Encryption')"
+    info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$INSTALL_MODE" "$sni" "$sid"
 }
 
