@@ -816,11 +816,11 @@ modify_config() {
     step=$((step + 1)); print_step "$step" "$total" "正在写入并校验新配置..."
     if [ "$target_mode" = reality ]; then
         if ! write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid" true; then
-            error "配置写入失败，未修改当前配置。"
+            error "配置写入失败。"
             return 1
         fi
     elif ! write_config "$port" "$uuid" "$dec" "$enc" encryption "" "" "" "" true; then
-        error "配置写入失败，未修改当前配置。"
+        error "配置写入失败。"
         return 1
     fi
     if ! restart_xray; then
