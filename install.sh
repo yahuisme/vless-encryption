@@ -461,6 +461,7 @@ show_subscription() {
     echo " 地址: $address"; echo " 端口: $port"; echo " UUID: $uuid"
     echo " 传输: tcp | 安全: $security"
     echo " 流控: xtls-rprx-vision"
+    [ "$security" = reality ] || echo " security=none：无 TLS 外层，仍由 VLESS Encryption 加密。"
     echo " 客户端 encryption: $encryption"
     [ "$security" != reality ] || { echo " SNI: $sni"; echo " Short ID: $sid"; echo " PublicKey: $public"; echo " 指纹: chrome"; }
     print_divider; cecho "$C_GREEN" " 订阅链接（已保存到 $SUBSCRIPTION_INFO）："; echo; cecho "$C_GREEN" "$link"; print_divider
@@ -708,9 +709,9 @@ interactive_install() {
     local choice port uuid sni="" sid="20220701" mode
     echo
     section_title "请选择安装模式（每次只能安装一种）"
-    info "安装 / 重装会覆盖 Xray 配置；两种模式均使用 Vision (xtls-rprx-vision)。"
-    info "客户端须支持 VLESS Encryption 及 encryption 参数；仅支持普通 VLESS/REALITY 的客户端不适用。"
-    info "认证: ${AUTH_MODE}；流量外观: ${TRAFFIC_MODE}（可用 install --auth / --mode 指定）。"
+    info "安装 / 重装覆盖 Xray 配置；请放行节点端口。"
+    info "客户端须支持 VLESS Encryption、encryption 参数及 Vision（xtls-rprx-vision）。"
+    info "Encryption 自身加密；需要 TLS 外观选 + REALITY。"
     menu_item "$C_GREEN" "1." "VLESS Encryption"
     menu_item "$C_YELLOW" "2." "VLESS Encryption + REALITY"
     print_divider
@@ -723,11 +724,12 @@ interactive_install() {
     fi
     read -r -p " -> 请输入UUID (留空将自动生成): " uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
     if [ "$mode" = reality ]; then
+        info "SNI 目标须从服务器可达、支持 TLS 1.3（443）；无需自有域名或证书。"
         read -r -p " -> 请输入REALITY SNI域名 (默认: $(prompt_default www.sega.com)): " sni || { error "读取 SNI 失败。"; return 2; }; sni=${sni:-www.sega.com}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
         read -r -p " -> 请输入REALITY Short ID [2-16 位偶数长度十六进制] (默认: $(prompt_default 20220701)): " sid || { error "读取 Short ID 失败。"; return 2; }; sid=${sid:-20220701}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
     fi
     print_divider
-    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
+    info "开始安装：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')；认证 ${AUTH_MODE} / 外观 ${TRAFFIC_MODE}（选项见 --help）。"
     install_selected "$port" "$uuid" "$mode" "$sni" "$sid"
 }
 
@@ -746,6 +748,9 @@ modify_config() {
 
     echo
     section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
+    info "仅修改首个入站相关字段；SNI 同步目标为该域名:443，其余保留。"
+    info "Encryption 自身加密；+ REALITY 增加 TLS 外观。"
+    info "保留模式保留密钥；切换按 ${AUTH_MODE}/${TRAFFIC_MODE} 重新生成密钥，须重新导入节点。"
     cecho "$C_CYAN" " 请选择修改方式：" 1
     print_divider
     menu_item "$C_GREEN" "1." "保留当前模式，只修改参数"
@@ -789,6 +794,7 @@ modify_config() {
         else
             sni="www.sega.com"
         fi
+        info "SNI 目标须从服务器可达、支持 TLS 1.3（443）；无需自有域名或证书。"
         read -r -p " -> REALITY SNI (当前/默认: $(prompt_default "$sni"), 回车保留): " input || { error "读取 SNI 失败。"; return 2; }; sni=${input:-$sni}; valid_sni "$sni" || { error "SNI 格式无效。"; return 1; }
         read -r -p " -> REALITY Short ID [2-16 位偶数长度十六进制] (当前/默认: $(prompt_default "$sid"), 回车保留): " input || { error "读取 Short ID 失败。"; return 2; }; sid=${input:-$sid}; valid_short_id "$sid" || { error "Short ID 格式无效。"; return 1; }
         # 仅切换到 REALITY 时生成新密钥；保留模式从现有私钥推导。
@@ -901,12 +907,18 @@ Xray VLESS Unified Installer ${SCRIPT_VERSION}
   --uuid <UUID>       UUID（默认：自动生成）
   --auth <认证模式>   mlkem768（ML-KEM-768，后量子认证）或 x25519（非后量子认证）
                       默认：mlkem768
-  --mode <流量外观>   native、xorpub 或 random（默认：native）
+  --mode <流量外观>   native 原始格式；xorpub 混淆公钥部分；random 全随机外观
+                      默认：native；无特殊需求保持默认，客户端须与服务端一致
   --sni <域名>        启用 REALITY + Vision；该模式必填
   --short-id <ID>     REALITY Short ID：2-16 位偶数长度十六进制（默认：20220701）
   -h, --help         显示帮助
 
 两种模式均使用 Vision（xtls-rprx-vision）；客户端须支持 VLESS Encryption 及 encryption 参数。
+Encryption 自身加密（security=none 不代表明文）；+ REALITY 增加 TLS 外观。
+SNI 是服务器可达、支持 TLS 1.3 的目标域名（443），无需自有域名或证书。
+认证一般选默认 mlkem768；x25519 认证密钥更短，但不具备后量子认证能力。
+两种认证均使用 mlkem768x25519plus 后量子密钥交换；不要混用两组密钥。
+安装 / 重装覆盖整个 Xray 配置；请自行放行节点端口。
 
 示例：
   $0 install --port 12345
