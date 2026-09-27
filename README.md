@@ -2,7 +2,7 @@
 
 Xray VLESS Encryption 安装与管理脚本。
 
-当前版本：`v26.09.11`
+当前版本：`v26.09.27`
 
 支持两种模式：
 
@@ -13,7 +13,7 @@ Xray VLESS Encryption 安装与管理脚本。
 
 客户端及其内核须支持 VLESS Encryption，并能导入链接中的 `encryption` 参数；仅支持普通 VLESS/REALITY 的客户端不适用。
 
-需要 root 权限，脚本会自动安装缺失的 `curl`、`jq`。
+需要 root 权限和 systemd，脚本会自动补齐下载、JSON、校验、进程及端口检查工具。
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/main/install.sh)
@@ -54,7 +54,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/ma
 
 直接运行脚本进入菜单，可执行安装、更新、重启、卸载、修改配置和查看订阅。
 
-安装或重装会覆盖 Xray 配置；修改参数或切换模式只更新首个入站的相关字段，保留监听地址及其他自定义配置。卸载会调用官方 `remove --purge`（仅残留文件时直接清理），删除 Xray 配置、日志和客户端信息，全部成功后才删除本脚本。回滚失败的快照保留并显示路径，须手动恢复或清理。
+安装或重装会覆盖 Xray 配置；修改参数或切换模式只更新首个入站的相关字段，保留监听地址及其他自定义配置。卸载会调用官方 `remove --purge`，仅残留文件时直接清理；先确认受管进程停止，再删除配置、日志和客户端信息，全部成功后才删除本脚本。回滚失败的快照保留并显示路径，同一会话禁止覆盖恢复基准，须先手动恢复并清理快照。启动检查确认真实主进程持续运行，不代替远程连通性验证。
 
 保留模式修改会保留加密密钥；切换模式会按默认 `mlkem768/native` 重新生成密钥，须重新导入节点链接。修改 SNI 会同步更新目标为该域名的 443 端口。请自行放行节点端口。
 

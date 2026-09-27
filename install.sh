@@ -2,12 +2,12 @@
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
 # 系统支持: Debian 10+ / Ubuntu 20.04+
-# 版本: v26.09.11
+# 版本: v26.09.27
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.11"
+SCRIPT_VERSION="v26.09.27"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -62,35 +62,46 @@ require_root_and_dependencies() {
     elif command -v dnf >/dev/null 2>&1; then pm=dnf
     elif command -v yum >/dev/null 2>&1; then pm=yum
     else error "仅支持 apt、dnf 或 yum 系统。"; exit 1; fi
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
-        info "正在安装缺失依赖（curl、jq、coreutils）..."
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        info "正在安装依赖与进程、端口检查工具..."
         case "$pm" in
-            apt) apt-get -o DPkg::Lock::Timeout=600 update && apt-get -o DPkg::Lock::Timeout=600 install -y curl jq coreutils ;;
-            dnf|yum) "$pm" install -y curl jq coreutils ;;
+            apt) apt-get -o DPkg::Lock::Timeout=600 update && apt-get -o DPkg::Lock::Timeout=600 install -y curl jq coreutils procps iproute2 ;;
+            dnf|yum) "$pm" install -y curl jq coreutils procps-ng iproute ;;
         esac
     fi
-    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
-        error "依赖安装失败，请手动安装 curl、jq、coreutils 后重试。"
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1 || ! command -v pgrep >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        error "依赖安装失败，请检查 curl、jq、sha256sum、pgrep 和 ss。"
         exit 1
     fi
 }
 
-# 端口占用预检查（无 ss 且无 netstat 时跳过，由 restart 失败兜底）
+# 0=占用，1=空闲，2=无法确认。
 port_in_use() {
-    local port=$1 port_in_use=false
-    if command -v ss >/dev/null 2>&1; then
-        if ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . || \
-           ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
-            port_in_use=true
-        fi
+    local port="$1" tcp udp listeners
+    if command -v ss >/dev/null 2>&1 &&
+       tcp=$(ss -H -ltn "sport = :$port" 2>/dev/null) &&
+       udp=$(ss -H -lun "sport = :$port" 2>/dev/null); then
+        [ -n "$tcp$udp" ]
+        return
     fi
-    # ss 不可用或版本过旧（iproute2 < 4.9 无 -H，调用失败）时回退 netstat，避免静默跳过检查
-    if [ "$port_in_use" = false ] && command -v netstat >/dev/null 2>&1; then
-        if netstat -tuln 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" || $4 ~ p" " {found=1} END {exit !found}'; then
-            port_in_use=true
-        fi
+    if command -v netstat >/dev/null 2>&1 && listeners=$(netstat -tuln 2>/dev/null); then
+        awk -v p=":$port" '$4 ~ p"$" {found=1} END {exit !found}' <<< "$listeners"
+        return
     fi
-    [ "$port_in_use" = true ]
+    return 2
+}
+
+check_port() {
+    local status
+    if port_in_use "$1"; then
+        error "端口 $1 已被占用，请选择其他端口。"
+        return 1
+    else
+        status=$?
+        [ "$status" -eq 1 ] && return 0
+        error "无法查询 TCP/UDP 监听状态，请检查 ss 或 netstat。"
+        return 1
+    fi
 }
 
 # 当前配置端口（用于同端口重装/修改时豁免占用检查）
@@ -189,8 +200,8 @@ extract_vlessenc_value() {
     awk -v section="$section" -v field="$field" '
         $0 == section { inside=1; next }
         inside && /^Authentication:/ { exit }
-        inside && $0 ~ ("\\\"" field "\\\":[[:space:]]*\\\"") {
-            value=$0; sub(/^[^\"]*\"[^\"]*\":[[:space:]]*\"/, "", value); sub(/\".*$/, "", value); print value; exit
+        inside && $0 ~ ("\"" field "\":[[:space:]]*\"") {
+            value=$0; sub(/^[^"]*"[^"]*":[[:space:]]*"/, "", value); sub(/".*$/, "", value); print value; exit
         }
     ' <<< "$output"
 }
@@ -269,6 +280,9 @@ write_config() {
     local port="$1" uuid="$2" decryption="$3" encryption="$4" mode="$5" private="${6:-}" public="${7:-}" sni="${8:-}" short_id="${9:-}"
     local tmp account user group enc_tmp reality_tmp test_log snapshot merged
     local preserve="${10:-false}"
+    if [ -n "$ROLLBACK_DIR" ] && [ -d "$ROLLBACK_DIR" ]; then
+        error "存在未完成恢复，请先处理快照：$ROLLBACK_DIR"; return 1
+    fi
     validate_encryption_token "$encryption" 0rtt || return 1
     if [ "$mode" = reality ]; then
         validate_reality_key "$private" && validate_reality_key "$public" && valid_sni "$sni" && valid_short_id "$short_id" || return 1
@@ -298,6 +312,7 @@ write_config() {
                 .streamSettings.realitySettings |= (
                   if .serverNames[0] != $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0] then
                     .dest = $new[0].inbounds[0].streamSettings.realitySettings.dest |
+                    if has("target") then .target = .dest else . end |
                     .serverNames[0] = $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0]
                   else . end |
                   .shortIds[0] = $new[0].inbounds[0].streamSettings.realitySettings.shortIds[0])
@@ -368,6 +383,7 @@ write_config() {
 valid_ipv6() {
     local ip="$1" part tail left right count=0 octet
     local -a parts octets
+    [[ "$ip" != :* || "$ip" == ::* ]] && [[ "$ip" != *: || "$ip" == *:: ]] || return 1
     if [[ "$ip" == *.* ]]; then
         tail=${ip##*:}
         IFS=. read -r -a octets <<< "$tail"
@@ -436,6 +452,9 @@ show_subscription() {
     }
     address=$(public_ip) || { error "无法获取公网 IP，无法生成订阅链接。"; return 1; }
     uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG"); port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG"); encryption=$(<"$ENCRYPTION_INFO")
+    if ! valid_port "$port" || ! valid_uuid "$uuid" || ! validate_encryption_token "$encryption" 0rtt; then
+        error "客户端加密信息或配置参数无效，未生成订阅链接。"; return 1
+    fi
     security=$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG")
     if [ "$security" = reality ]; then
         [ -f "$REALITY_INFO" ] || { error "缺少 REALITY 客户端信息。"; return 1; }
@@ -513,9 +532,55 @@ xray_status_line() {
     cecho "$C_CYAN" " 当前配置: $mode" 1
 }
 
+xray_pids() {
+    local candidates rc pid exe
+    if candidates=$(pgrep -x xray); then :; else
+        rc=$?; [ "$rc" -eq 1 ] && return 0; return 2
+    fi
+    for pid in $candidates; do
+        [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+        if ! exe=$(readlink "/proc/$pid/exe"); then
+            [ ! -d "/proc/$pid" ] && continue
+            return 2
+        fi
+        if [[ "$exe" = "$XRAY_BIN" || "$exe" = "$XRAY_BIN (deleted)" ]]; then printf '%s\n' "$pid"; fi
+    done
+}
+
+stop_xray_processes() {
+    local pids pid exe attempt
+    pids=$(xray_pids) || return 1
+    for pid in $pids; do
+        if ! exe=$(readlink "/proc/$pid/exe"); then
+            [ ! -d "/proc/$pid" ] && continue
+            return 1
+        fi
+        [[ "$exe" = "$XRAY_BIN" || "$exe" = "$XRAY_BIN (deleted)" ]] || continue
+        if ! kill -TERM "$pid"; then [ ! -d "/proc/$pid" ] || return 1; fi
+    done
+    for ((attempt=0; attempt<5; attempt++)); do
+        pids=$(xray_pids) || return 1
+        [ -z "$pids" ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+has_xray_residue() {
+    local path pids
+    for path in "$XRAY_BIN" "$XRAY_CONFIG" "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO" \
+        /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
+        /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+        /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d; do
+        if [ -e "$path" ] || [ -L "$path" ]; then return 0; fi
+    done
+    pids=$(xray_pids) || return 0
+    [ -n "$pids" ]
+}
+
 uninstall_xray() {
     local confirm
-    if [ ! -x "$XRAY_BIN" ] && [ ! -f "$XRAY_CONFIG" ] && [ ! -f "$ENCRYPTION_INFO" ] && [ ! -f "$REALITY_INFO" ] && [ ! -f "$SUBSCRIPTION_INFO" ] && [ ! -f /etc/systemd/system/xray.service ]; then
+    if ! has_xray_residue; then
         info "Xray 未安装，无需卸载。"
         return 0
     fi
@@ -525,17 +590,28 @@ uninstall_xray() {
     read -r -p "  确定继续？[y/N]: " confirm || { error "读取确认失败，已取消卸载。"; return 2; }
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then info "已取消卸载。"; return 0; fi
     print_step 1 3 "正在停止并卸载 Xray..."
-    if [ -x "$XRAY_BIN" ] || [ -f /etc/systemd/system/xray.service ]; then
+    if [ -f /etc/systemd/system/xray.service ] || systemctl is-active --quiet xray; then
+        systemctl stop xray || { error "停止 Xray 失败，已中止卸载。"; return 1; }
+        systemctl disable xray || { error "禁用 Xray 失败，已中止卸载。"; return 1; }
+    fi
+    stop_xray_processes || { error "无法确认 Xray 残留进程已停止，已中止卸载。"; return 1; }
+    if [[ -f "$XRAY_BIN" && -d "$(dirname "$XRAY_CONFIG")" &&
+          -f /etc/systemd/system/xray.service && -f /etc/systemd/system/xray@.service &&
+          -d /etc/systemd/system/xray.service.d && -d /etc/systemd/system/xray@.service.d ]]; then
         if ! run_official_installer remove --purge; then error "Xray 卸载失败。"; return 1; fi
     else
-        info "Xray 二进制与服务不存在，跳过官方卸载，仅清理残留。"
+        info "安装文件不完整，仅清理残留。"
     fi
     print_step 2 3 "正在清除配置和客户端信息..."
-    if ! rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray ||
-       ! rm -f "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"; then
+    if ! rm -rf /usr/local/etc/xray /usr/local/share/xray /var/log/xray \
+            /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d ||
+       ! rm -f "$XRAY_BIN" /etc/systemd/system/xray.service /etc/systemd/system/xray@.service \
+            "$ENCRYPTION_INFO" "$REALITY_INFO" "$SUBSCRIPTION_INFO"; then
         error "残留文件清理失败，保留本脚本以便重试。"; return 1
     fi
+    systemctl daemon-reload || { error "systemd 重载失败。"; return 1; }
     print_step 3 3 "正在确认卸载结果..."
+    stop_xray_processes || { error "仍有 Xray 残留进程。"; return 1; }
     if [ -e "$XRAY_BIN" ] || systemctl list-unit-files --no-legend 2>/dev/null | awk '{print $1}' | grep -qx 'xray.service'; then
         error "仍检测到 Xray 文件或服务，请使用菜单 5 查看日志。"
         return 1
@@ -565,6 +641,10 @@ rollback_config() {
 clear_rollback() { [ -z "$ROLLBACK_DIR" ] || { rm -rf "$ROLLBACK_DIR" || return 1; ROLLBACK_DIR=""; }; }
 begin_install_snapshot() {
     local dir geo
+    if { [ -n "$INSTALL_ROLLBACK_DIR" ] && [ -d "$INSTALL_ROLLBACK_DIR" ]; } ||
+       { [ -n "$ROLLBACK_DIR" ] && [ -d "$ROLLBACK_DIR" ]; }; then
+        error "存在未完成恢复，请先处理快照：${INSTALL_ROLLBACK_DIR:-$ROLLBACK_DIR}"; return 1
+    fi
     dir=$(mktemp -d /tmp/xray-install-rollback.XXXXXX) || return 1
     if ! chmod 700 "$dir" ||
        ! { [ ! -e "$XRAY_BIN" ] || cp -p "$XRAY_BIN" "$dir/xray"; } ||
@@ -590,9 +670,18 @@ begin_install_snapshot() {
 restore_install_snapshot() {
     if [ -z "$INSTALL_ROLLBACK_DIR" ] || [ ! -d "$INSTALL_ROLLBACK_DIR" ]; then return 0; fi
     error "正在恢复安装前的配置和 Xray 核心..."
-    local failed=false geo
-    if ! systemctl stop xray; then
-        error "停止 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+    local failed=false geo fresh=false
+    [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ] || fresh=true
+    if [ -f /etc/systemd/system/xray.service ] || systemctl is-active --quiet xray; then
+        if ! systemctl stop xray; then
+            error "停止 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+        fi
+        if [ "$fresh" = true ] && ! systemctl disable --now xray; then
+            error "禁用 Xray 失败，未覆盖文件；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
+        fi
+    fi
+    if ! stop_xray_processes; then
+        error "无法确认残留进程已停止；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
     fi
     if [ -f "$INSTALL_ROLLBACK_DIR/xray" ]; then cp -p "$INSTALL_ROLLBACK_DIR/xray" "$XRAY_BIN" || failed=true; else rm -f "$XRAY_BIN" || failed=true; fi
     if [ -f "$INSTALL_ROLLBACK_DIR/config.json" ]; then cp -p "$INSTALL_ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
@@ -608,9 +697,8 @@ restore_install_snapshot() {
     if [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ]; then
         cp -p "$INSTALL_ROLLBACK_DIR/xray.service" /etc/systemd/system/xray.service || failed=true
     elif [ ! -f "$INSTALL_ROLLBACK_DIR/xray" ]; then
-        if systemctl disable --now xray; then
-            rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service || failed=true
-        else failed=true; fi
+        rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service || failed=true
+        rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d || failed=true
     fi
     systemctl daemon-reload || failed=true
     if [ "$failed" = false ] && [ -f "$INSTALL_ROLLBACK_DIR/was-active" ] && [ -x "$INSTALL_ROLLBACK_DIR/xray" ]; then
@@ -648,10 +736,32 @@ abort_install() {
     return 1
 }
 uri_encode() { jq -nr --arg value "$1" '$value | @uri'; }
+xray_main_pid() {
+    local pid exe
+    pid=$(systemctl show xray --property=MainPID --value) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    exe=$(readlink "/proc/$pid/exe") || return 1
+    [[ "$exe" = "$XRAY_BIN" || "$exe" = "$XRAY_BIN (deleted)" ]] || return 1
+    printf '%s\n' "$pid"
+}
+
 restart_xray() {
     info "正在重启 Xray 服务..."
-    if systemctl restart xray && sleep 1 && systemctl is-active --quiet xray; then
-        success "Xray 服务已成功重启."; return 0
+    local pid='' observed attempt stable=false
+    if systemctl restart xray; then
+        for ((attempt=0; attempt<5; attempt++)); do
+            if systemctl is-active --quiet xray && pid=$(xray_main_pid); then stable=true; break; fi
+            sleep 1
+        done
+        if [ "$stable" = true ]; then
+            for ((attempt=0; attempt<3; attempt++)); do
+                sleep 1
+                if ! systemctl is-active --quiet xray || ! observed=$(xray_main_pid) || [ "$pid" != "$observed" ]; then
+                    stable=false; break
+                fi
+            done
+        fi
+        if [ "$stable" = true ]; then success "Xray 主进程持续运行。"; return 0; fi
     fi
     error "Xray 服务启动失败。"
     return 1
@@ -718,10 +828,7 @@ interactive_install() {
     read -r -p " 请输入选项 [1-2]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
     case "$choice" in 1) mode=encryption;; 2) mode=reality;; *) error "无效选项。"; return 1;; esac
     read -r -p " -> 请输入端口 [1-65535] (默认: $(prompt_default 443)): " port || { error "读取端口失败。"; return 2; }; port=${port:-443}; valid_port "$port" || { error "端口无效。"; return 1; }
-    if [ "$port" != "$(current_port)" ] && port_in_use "$port"; then
-        error "端口 $port 已被占用，请选择其他端口。"
-        return 1
-    fi
+    if [ "$port" != "$(current_port)" ]; then check_port "$port" || return 1; fi
     read -r -p " -> 请输入UUID (留空将自动生成): " uuid || { error "读取 UUID 失败。"; return 2; }; uuid=${uuid:-$("$XRAY_BIN" uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
     if [ "$mode" = reality ]; then
         info "SNI 目标须从服务器可达、支持 TLS 1.3（443）；无需自有域名或证书。"
@@ -736,6 +843,9 @@ interactive_install() {
 modify_config() {
     local current_mode target_mode choice port uuid sni="" sid="20220701" dec enc private="" public="" pair keys input
     local step=0 total=1
+    if [ -n "$INSTALL_ROLLBACK_DIR" ] && [ -d "$INSTALL_ROLLBACK_DIR" ]; then
+        error "存在未完成恢复，请先处理快照：$INSTALL_ROLLBACK_DIR"; return 1
+    fi
     if [ ! -f "$XRAY_CONFIG" ] || [ ! -f "$ENCRYPTION_INFO" ]; then
         error "未检测到可修改的 Xray 配置。"
         return 1
@@ -772,10 +882,7 @@ modify_config() {
     esac
 
     read -r -p " -> 新端口 (当前: $(prompt_default "$port"), 回车保留): " input || { error "读取端口失败。"; return 2; }; port=${input:-$port}; valid_port "$port" || { error "端口无效。"; return 1; }
-    if [ "$port" != "$(jq -r '.inbounds[0].port // empty' "$XRAY_CONFIG" 2>/dev/null)" ] && port_in_use "$port"; then
-        error "端口 $port 已被占用，请选择其他端口。"
-        return 1
-    fi
+    if [ "$port" != "$(current_port)" ]; then check_port "$port" || return 1; fi
     read -r -p " -> 新UUID (当前: $(prompt_default "$uuid"), 回车保留): " input || { error "读取 UUID 失败。"; return 2; }; uuid=${input:-$uuid}; valid_uuid "$uuid" || { error "UUID 格式无效。"; return 1; }
 
     if [ "$target_mode" != "$current_mode" ]; then
@@ -825,7 +932,7 @@ modify_config() {
     fi
     if ! restart_xray; then
         error "正在回滚配置。"
-        rollback_config || true
+        rollback_config || return 1
         if ! restart_xray; then
             error "回滚后 Xray 仍未运行，请立即检查服务和配置。"
         fi
@@ -862,7 +969,7 @@ main_menu() {
         print_divider
         read -r -p " 请输入选项 [0-7]: " choice || { error "读取菜单输入失败，请在交互式终端中运行。"; return 2; }
         case "$choice" in
-            1) ( interactive_install ) || true ;;
+            1) interactive_install || true ;;
             2)
                 current_version=$(current_xray_version || true)
                 latest_version=$(latest_xray_version || true)
@@ -881,7 +988,7 @@ main_menu() {
             3) ( restart_xray ) || true ;;
             4) ( uninstall_xray ) || true ;;
             5) journalctl -u xray -f --no-pager || true ;;
-            6) ( modify_config ) || true ;;
+            6) modify_config || true ;;
             7) ( show_subscription ) || true ;;
             0) success "感谢使用。"; return ;;
             *) error "无效选项。" ;;
@@ -959,10 +1066,7 @@ main() {
     if [ -n "$sni" ]; then INSTALL_MODE=reality; valid_sni "$sni" || { error "SNI 域名格式无效。"; exit 1; }; valid_short_id "$sid" || { error "Short ID 格式无效。"; exit 1; }
     else INSTALL_MODE=encryption; [ "$REALITY_SHORT_ID_SET" = false ] || { error "--short-id 只能与 --sni（REALITY 模式）一起使用。"; exit 2; }; fi
     # 端口占用预检查（同端口重装豁免）
-    if [ "$port" != "$(current_port)" ] && port_in_use "$port"; then
-        error "端口 $port 已被占用，请选择其他端口。"
-        exit 1
-    fi
+    if [ "$port" != "$(current_port)" ]; then check_port "$port" || return 1; fi
     info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
     install_selected "$port" "$uuid" "$INSTALL_MODE" "$sni" "$sid"
 }
