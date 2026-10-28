@@ -2,12 +2,12 @@
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
 # 系统支持: Debian 10+ / Ubuntu 20.04+
-# 版本: v26.09.27
+# 版本: v26.10.28
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.09.27"
+SCRIPT_VERSION="v26.10.28"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -138,16 +138,35 @@ xray_supports() {
 }
 service_account() {
     local user group
-    user=$(systemctl show -p User --value xray 2>/dev/null || true)
-    group=$(systemctl show -p Group --value xray 2>/dev/null || true)
-    for service_file in /etc/systemd/system/xray.service /lib/systemd/system/xray.service /usr/lib/systemd/system/xray.service; do
-        [ -f "$service_file" ] || continue
-        [ -n "$user" ] || user=$(awk -F= '/^[[:space:]]*User=/{print $2; exit}' "$service_file")
-        [ -n "$group" ] || group=$(awk -F= '/^[[:space:]]*Group=/{print $2; exit}' "$service_file")
-    done
+    user=$(systemctl show -p User xray 2>/dev/null) || return 1
+    group=$(systemctl show -p Group xray 2>/dev/null) || return 1
+    [[ "$user" = User=* && "$group" = Group=* && "$user$group" != *$'\n'* ]] || return 1
+    user=${user#User=}; group=${group#Group=}
     user=${user:-root}; group=${group:-$(id -gn "$user")}
     id "$user" >/dev/null 2>&1 && getent group "$group" >/dev/null 2>&1 || return 1
     printf '%s:%s\n' "$user" "$group"
+}
+
+normalize_official_writes() {
+    local script="$1" content needle rest
+    # shellcheck disable=SC2016 # 固定上游源码，仅匹配字面量，不展开变量。
+    local -a writes=(
+        '    install -m 755 "${TMP_DIRECTORY}/$NAME" "/usr/local/bin/$NAME"'
+        '    install -m 644 "${TMP_DIRECTORY}/$NAME" "${DAT_PATH}/$NAME"'
+        '  install_file xray'
+        '  install -d "$DAT_PATH"'
+        '  install -m 644 "${dir_tmp}"/${file_dlc} "${DAT_PATH}"/${file_site}'
+        '  install -m 644 "${dir_tmp}"/${file_ip} "${DAT_PATH}"/${file_ip}'
+    )
+    content=$(< "$script")
+    for needle in "${writes[@]}"; do
+        needle=$'\n'"$needle"$'\n'
+        [[ "$content" = *"$needle"* ]] || return 1
+        rest=${content#*"$needle"}
+        [[ "$rest" != *"$needle"* ]] || return 1
+        content=${content/"$needle"/"${needle%$'\n'} || exit 1"$'\n'}
+    done
+    printf '%s\n' "$content" > "$script"
 }
 
 run_official_installer() {
@@ -169,7 +188,9 @@ run_official_installer() {
         error "官方安装脚本末尾语义不匹配，已拒绝执行。"; return 1
     fi
     printf '%s\n' "${source_text/"$stopped_tail"/$'    if [[ "$XRAY_RUNNING" -eq \'1\' ]]; then start_xray; fi\n  else\n'}" > "$script_file" || return 1
-    bash "$script_file" "$@" >"$log_file" 2>&1 || rc=$?
+    normalize_official_writes "$script_file" || { error "官方安装脚本写入检查未匹配，已拒绝执行。"; return 1; }
+    DAT_PATH=/usr/local/share/xray JSON_PATH=/usr/local/etc/xray JSONS_PATH='' \
+        bash "$script_file" "$@" >"$log_file" 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
         error "官方 Xray 安装程序执行失败，以下为末尾日志："
         tail -n 30 "$log_file" >&2 || true
@@ -240,7 +261,7 @@ validate_encryption_token() {
 
 generate_encryption_pair() {
     local out section decryption encryption
-    out=$("$XRAY_BIN" vlessenc 2>/dev/null) || true
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null) || { error "生成 VLESS Encryption 配置失败。"; return 1; }
     [ -n "$out" ] || { error "生成 VLESS Encryption 配置失败。"; return 1; }
     if [ "$AUTH_MODE" = mlkem768 ]; then section="Authentication: ML-KEM-768, Post-Quantum"; else section="Authentication: X25519, not Post-Quantum"; fi
     decryption=$(extract_vlessenc_value "$out" "$section" decryption)
@@ -266,7 +287,7 @@ validate_reality_key() {
 
 generate_reality_keys() {
     local out private public
-    out=$("$XRAY_BIN" x25519 2>/dev/null) || true
+    out=$("$XRAY_BIN" x25519 2>/dev/null) || { error "生成 REALITY 密钥对失败。"; return 1; }
     private=$(awk '/^(PrivateKey:|Private key:)/ {print $NF; exit}' <<< "$out")
     public=$(awk '/^(Password|PublicKey:|Public key:)/ {print $NF; exit}' <<< "$out")
     if ! validate_reality_key "$private" || ! validate_reality_key "$public"; then
@@ -294,10 +315,10 @@ write_config() {
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     if [ "$mode" = reality ]; then
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" --arg private "$private" --arg sni "$sni" --arg sid "$short_id" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{network:"tcp",security:"reality",realitySettings:{show:false,dest:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{method:"raw",security:"reality",realitySettings:{show:false,target:($sni+":443"),xver:0,serverNames:[$sni],privateKey:$private,shortIds:[$sid]}}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     else
         jq -n --argjson port "$port" --arg uuid "$uuid" --arg decryption "$decryption" '
-          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{clients:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption}}],outbounds:[{protocol:"freedom",settings:{domainStrategy:"UseIPv4v6"}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
+          {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{method:"raw",security:"none"}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     if [ "$preserve" = true ]; then
         merged=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || { rm -f "$tmp"; return 1; }
@@ -306,13 +327,19 @@ write_config() {
           .inbounds[0] |= (
             .port = $new[0].inbounds[0].port |
             .settings.decryption = $new[0].inbounds[0].settings.decryption |
-            .settings.clients[0].id = $new[0].inbounds[0].settings.clients[0].id |
+            .settings.users = (.settings.clients // .settings.users) | del(.settings.clients) |
+            .settings.users[0].id = $new[0].inbounds[0].settings.users[0].id |
+            .streamSettings |= (
+              .method = (.method // .network // "raw") |
+              if .method == "tcp" then .method = "raw" else . end |
+              if .rawSettings == null and .tcpSettings != null then .rawSettings = .tcpSettings else . end |
+              del(.network, .tcpSettings)) |
             if $new[0].inbounds[0].streamSettings.security == "reality" then
               if .streamSettings.security == "reality" then
                 .streamSettings.realitySettings |= (
+                  .target = (.target // .dest) | del(.dest, .publicKey, .password) |
                   if .serverNames[0] != $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0] then
-                    .dest = $new[0].inbounds[0].streamSettings.realitySettings.dest |
-                    if has("target") then .target = .dest else . end |
+                    .target = $new[0].inbounds[0].streamSettings.realitySettings.target |
                     .serverNames[0] = $new[0].inbounds[0].streamSettings.realitySettings.serverNames[0]
                   else . end |
                   .shortIds[0] = $new[0].inbounds[0].streamSettings.realitySettings.shortIds[0])
@@ -323,7 +350,18 @@ write_config() {
               if .streamSettings.security == "reality" then
                 .streamSettings |= (del(.realitySettings) | .security = "none")
               else . end
-            end)' "$XRAY_CONFIG" > "$merged"; then
+            end) |
+          if .outbounds != null then .outbounds |= map(
+            if .protocol == "freedom" then
+              (if (.targetStrategy // "" | ascii_downcase) != "" and (.targetStrategy | ascii_downcase) != "asis" then .targetStrategy
+               elif (.settings.targetStrategy // "") != "" then .settings.targetStrategy
+               else .settings.domainStrategy // "" end) as $strategy |
+              if ($strategy | ascii_downcase) != "" and ($strategy | ascii_downcase) != "asis" then
+                .streamSettings.sockopt.domainStrategy = $strategy
+              else . end |
+              del(.targetStrategy, .settings.targetStrategy, .settings.domainStrategy)
+            else . end)
+          else . end' "$XRAY_CONFIG" > "$merged"; then
             rm -f "$tmp" "$merged"; return 1
         fi
         mv -f "$merged" "$tmp" || { rm -f "$tmp" "$merged"; return 1; }
@@ -410,24 +448,28 @@ valid_ipv6() {
     if [ "$left" = full ]; then [ "$count" = 8 ]; else [ "$count" -lt 8 ]; fi
 }
 
+valid_ipv4() {
+    local octet
+    local -a octets
+    [[ "$1" =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$1"
+    for octet in "${octets[@]}"; do [ "$octet" -le 255 ] || return 1; done
+}
+
 public_ip() {
-    local ip valid octet cache_file="/usr/local/etc/xray/.public-ip"
-    local -a ip_octets
+    local ip cache_file="/usr/local/etc/xray/.public-ip"
     # 缓存 1 天，避免每次查看配置都发起网络请求；公网 IP 变更后自动刷新
     if [ -f "$cache_file" ] && [ -z "$(find "$cache_file" -mmin +1440 2>/dev/null)" ]; then
         ip=$(<"$cache_file")
-        [ -n "$ip" ] && { printf '%s\n' "$ip"; return; }
+        if valid_ipv4 "$ip" || { [[ "$ip" = \[*\] ]] && valid_ipv6 "${ip:1:${#ip}-2}"; }; then
+            printf '%s\n' "$ip"; return
+        fi
     fi
     for endpoint in https://api-ipv4.ip.sb/ip https://api.ipify.org https://ip.seeip.org; do
         ip=$(curl -4fs --max-time 5 "$endpoint" 2>/dev/null || true)
-        if [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-            valid=true
-            IFS='.' read -r -a ip_octets <<< "$ip"
-            for octet in "${ip_octets[@]}"; do [ "$octet" -le 255 ] || valid=false; done
-            if [ "$valid" = true ]; then
-                { [[ -d "${cache_file%/*}" ]] && printf '%s\n' "$ip" 2>/dev/null > "$cache_file"; } || true
-                printf '%s\n' "$ip"; return
-            fi
+        if valid_ipv4 "$ip"; then
+            { [[ -d "${cache_file%/*}" ]] && printf '%s\n' "$ip" 2>/dev/null > "$cache_file"; } || true
+            printf '%s\n' "$ip"; return
         fi
     done
     for endpoint in https://api-ipv6.ip.sb/ip https://api64.ipify.org; do
@@ -441,17 +483,17 @@ public_ip() {
 }
 
 show_subscription() {
-    local address uuid port encryption security public sni sid link title
+    local address uuid port encryption security public sni sid link title seed verify="" keys
     if [ ! -f "$XRAY_CONFIG" ] || [ ! -f "$ENCRYPTION_INFO" ]; then
         error "缺少配置或客户端信息。"
         return 1
     fi
-    jq -e '.inbounds[0].port and .inbounds[0].settings.clients[0].id and .inbounds[0].settings.decryption' "$XRAY_CONFIG" >/dev/null 2>&1 || {
+    jq -e '.inbounds[0].port and (.inbounds[0].settings.clients // .inbounds[0].settings.users)[0].id and .inbounds[0].settings.decryption' "$XRAY_CONFIG" >/dev/null 2>&1 || {
         error "Xray 配置结构无效，无法生成订阅链接。"
         return 1
     }
     address=$(public_ip) || { error "无法获取公网 IP，无法生成订阅链接。"; return 1; }
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG"); port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG"); encryption=$(<"$ENCRYPTION_INFO")
+    uuid=$(jq -r '(.inbounds[0].settings.clients // .inbounds[0].settings.users)[0].id' "$XRAY_CONFIG"); port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG"); encryption=$(<"$ENCRYPTION_INFO")
     if ! valid_port "$port" || ! valid_uuid "$uuid" || ! validate_encryption_token "$encryption" 0rtt; then
         error "客户端加密信息或配置参数无效，未生成订阅链接。"; return 1
     fi
@@ -462,8 +504,16 @@ show_subscription() {
         if ! validate_reality_key "$public" || ! valid_sni "$sni" || ! valid_short_id "$sid"; then
             error "REALITY 客户端信息无效，请先修改配置修复。"; return 1
         fi
+        seed=$(jq -r '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$XRAY_CONFIG") || return 1
+        if [ -n "$seed" ]; then
+            validate_reality_key "$seed" || { error "ML-DSA-65 种子无效。"; return 1; }
+            keys=$("$XRAY_BIN" mldsa65 -i "$seed") || return 1
+            verify=$(awk '/^Verify:/ {print $2}' <<< "$keys")
+            [[ "$verify" =~ ^[A-Za-z0-9_-]{2602}[AEIMQUYcgkosw048]$ ]] || { error "无法推导 ML-DSA-65 验证公钥。"; return 1; }
+        fi
         title="$(hostname) VLESS-E-REALITY"
         link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")&security=reality&sni=$(uri_encode "$sni")&sid=$(uri_encode "$sid")&fp=chrome&pbk=$(uri_encode "$public")&flow=xtls-rprx-vision&type=tcp#$(uri_encode "$title")"
+        if [ -n "$verify" ]; then link="${link%%#*}&pqv=${verify}#${link#*#}"; fi
     else
         title="$(hostname) VLESS-E"
         link="vless://${uuid}@${address}:${port}?encryption=$(uri_encode "$encryption")&flow=xtls-rprx-vision&type=tcp&security=none#$(uri_encode "$title")"
@@ -738,8 +788,9 @@ abort_install() {
 uri_encode() { jq -nr --arg value "$1" '$value | @uri'; }
 xray_main_pid() {
     local pid exe
-    pid=$(systemctl show xray --property=MainPID --value) || return 1
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    pid=$(systemctl show xray --property=MainPID) || return 1
+    [[ "$pid" =~ ^MainPID=([1-9][0-9]*)$ ]] || return 1
+    pid=${BASH_REMATCH[1]}
     exe=$(readlink "/proc/$pid/exe") || return 1
     [[ "$exe" = "$XRAY_BIN" || "$exe" = "$XRAY_BIN (deleted)" ]] || return 1
     printf '%s\n' "$pid"
@@ -842,7 +893,7 @@ interactive_install() {
 
 modify_config() {
     local current_mode target_mode choice port uuid sni="" sid="20220701" dec enc private="" public="" pair keys input
-    local step=0 total=1
+    local step=0 total=1 was_active=false
     if [ -n "$INSTALL_ROLLBACK_DIR" ] && [ -d "$INSTALL_ROLLBACK_DIR" ]; then
         error "存在未完成恢复，请先处理快照：$INSTALL_ROLLBACK_DIR"; return 1
     fi
@@ -854,7 +905,7 @@ modify_config() {
     current_mode=$(jq -r '.inbounds[0].streamSettings.security // "none"' "$XRAY_CONFIG")
     [ "$current_mode" = reality ] || current_mode=encryption
     port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")
-    uuid=$(jq -r '.inbounds[0].settings.clients[0].id' "$XRAY_CONFIG")
+    uuid=$(jq -r '(.inbounds[0].settings.clients // .inbounds[0].settings.users)[0].id' "$XRAY_CONFIG")
 
     echo
     section_title "当前模式：$([ "$current_mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
@@ -920,6 +971,7 @@ modify_config() {
         pair=$(generate_encryption_pair) || return 1
         IFS='|' read -r dec enc <<< "$pair"
     fi
+    if systemctl is-active --quiet xray; then was_active=true; fi
     step=$((step + 1)); print_step "$step" "$total" "正在写入并校验新配置..."
     if [ "$target_mode" = reality ]; then
         if ! write_config "$port" "$uuid" "$dec" "$enc" reality "$private" "$public" "$sni" "$sid" true; then
@@ -930,15 +982,17 @@ modify_config() {
         error "配置写入失败。"
         return 1
     fi
-    if ! restart_xray; then
+    if [ "$was_active" = true ] && ! restart_xray; then
         error "正在回滚配置。"
+        systemctl stop xray || { error "停止 Xray 失败，快照保留在 $ROLLBACK_DIR"; return 1; }
         rollback_config || return 1
         if ! restart_xray; then
             error "回滚后 Xray 仍未运行，请立即检查服务和配置。"
         fi
         return 1
     fi
-    clear_rollback
+    clear_rollback || return 1
+    [ "$was_active" = true ] || info "服务原处于停止状态，配置将在下次启动时生效。"
     success "配置已更新为 $([ "$target_mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')。"
     show_subscription
 }
@@ -1036,8 +1090,7 @@ EOF
 
 main() {
     if [ "$#" -gt 0 ] && [ "$1" != install ]; then error "未知参数: $1"; return 2; fi
-    require_root_and_dependencies
-    if [ "$#" -eq 0 ]; then main_menu; return; fi
+    if [ "$#" -eq 0 ]; then require_root_and_dependencies; main_menu; return; fi
     shift
     local port=443 uuid="" sni="" sid=20220701
     while [ "$#" -gt 0 ]; do
@@ -1065,6 +1118,7 @@ main() {
     valid_uuid "$uuid" || { error "UUID 格式无效。"; exit 1; }
     if [ -n "$sni" ]; then INSTALL_MODE=reality; valid_sni "$sni" || { error "SNI 域名格式无效。"; exit 1; }; valid_short_id "$sid" || { error "Short ID 格式无效。"; exit 1; }
     else INSTALL_MODE=encryption; [ "$REALITY_SHORT_ID_SET" = false ] || { error "--short-id 只能与 --sni（REALITY 模式）一起使用。"; exit 2; }; fi
+    require_root_and_dependencies
     # 端口占用预检查（同端口重装豁免）
     if [ "$port" != "$(current_port)" ]; then check_port "$port" || return 1; fi
     info "安装模式：$([ "$INSTALL_MODE" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')"
