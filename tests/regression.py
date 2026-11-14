@@ -18,8 +18,12 @@ error() { printf 'ERROR %s\\n' "$*" >&2; }; warning() { :; }; info() { :; }; suc
 systemctl() { return 99; }; kill() { exit 99; }; pkill() { exit 99; }; pgrep() { return 99; }; apt-get() { exit 99; }; curl() { exit 99; }; sleep() { :; }
 '''
    if 'restore_install_snapshot' in names:
-    names=list(dict.fromkeys(names+['xray_pids','stop_xray_processes']))
+    names=list(dict.fromkeys(names+['xray_pids','stop_xray_processes','clear_rollback']))
     setup+='\npgrep() { return 1; }\n'
+   if 'on_exit' in names:
+    names=list(dict.fromkeys(names+['clear_rollback']))
+   if any(n in names for n in ('rollback_config', 'restore_install_snapshot')) and 'restore_file()' in SRC:
+    names=list(dict.fromkeys(names+['restore_file']))
    text='\n'.join(extract(n) for n in names)
    for a,b in [('/etc/systemd/system',d+'/system'),('/usr/local/share/xray',d+'/geo'),('/usr/local/etc/xray',d+'/etc'),('/var/log/xray',d+'/logs'),('/tmp/xray-',d+'/snapshot-'),('/proc/',d+'/proc/')]:text=text.replace(a,b)
    f=pathlib.Path(d)/'fixture.sh';f.write_text(setup+text+'\n'+body)
@@ -180,6 +184,26 @@ if FAULT=write-failure command bash "$RUN/core-write.sh"; then exit 81; fi
 [[ $(FAULT=none command bash "$RUN/core-write.sh") = completed ]]
 if normalize_official_writes official; then exit 81; fi
 ''')
+ def test_preserved_config_rejects_multiple_json_documents(self):
+  self.run_case(['write_config'],r'''
+validate_encryption_token() { :; }; service_account() { printf '%s:%s' "$(id -u)" "$(id -g)"; }
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+printf '%s\n' '{"inbounds":[{"port":443,"settings":{"users":[{"id":"old"}]}}]}' '{}' > "$XRAY_CONFIG"
+cp "$XRAY_CONFIG" original
+if write_config 443 uuid dec enc encryption '' '' '' '' true; then exit 81; fi
+cmp original "$XRAY_CONFIG"
+[[ -z "$ROLLBACK_DIR" ]]
+''')
+ def test_preserved_inbound_port_conflict_rejected(self):
+  self.run_case(['write_config'],r'''
+validate_encryption_token() { :; }; service_account() { printf '%s:%s' "$(id -u)" "$(id -g)"; }
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+printf '%s' '{"inbounds":[{"port":443,"settings":{"users":[{"id":"old"}]}},{"port":"8000-9000","protocol":"socks"}]}' > "$XRAY_CONFIG"
+cp "$XRAY_CONFIG" original
+if write_config 8388 uuid dec enc encryption '' '' '' '' true; then exit 81; fi
+cmp original "$XRAY_CONFIG"
+[[ -z "$ROLLBACK_DIR" ]]
+''')
  def test_current_schema_and_legacy_migration(self):
   self.run_case(['write_config'],r'''
 validate_encryption_token() { :; }; validate_reality_key() { :; }; valid_sni() { :; }; valid_short_id() { :; }
@@ -256,6 +280,113 @@ for AUTH_MODE in x25519 mlkem768; do
  done
 done
 ''')
+ def test_nested_rollback_cleanup_interrupt_keeps_outer_baseline(self):
+  names=['restore_file','on_exit','rollback_config','clear_rollback','begin_install_snapshot','restore_install_snapshot','clear_install_snapshot','abort_install']
+  traps='\n'.join(re.findall(r'^trap .* (?:EXIT|INT|TERM)$', SRC, re.M))
+  self.run_case(names,r'''
+mkdir -p "$RUN/system" "$RUN/geo"
+printf BASELINE > "$XRAY_CONFIG"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+printf UNIT > "$RUN/system/xray.service"
+systemctl() { [[ "$1" != is-active ]]; }; pgrep() { return 1; }
+(
+'''+traps+r'''
+ begin_install_snapshot || exit 1
+ outer=$INSTALL_ROLLBACK_DIR
+ ROLLBACK_DIR="$RUN/inner"; mkdir "$ROLLBACK_DIR"
+ printf INTERMEDIATE > "$ROLLBACK_DIR/config.json"
+ printf CURRENT > "$XRAY_CONFIG"
+ rm() { command rm "$@" || return 1; if [[ "$*" == *"$outer"* ]]; then builtin kill -TERM "$BASHPID"; fi; }
+ abort_install
+ exit 91
+) && exit 81 || result=$?
+[[ $result = 143 && $(< "$XRAY_CONFIG") = BASELINE ]]
+''')
+ def test_exit_recovery_failure_returns_nonzero(self):
+  names=['on_exit','rollback_config','clear_rollback','restore_install_snapshot','clear_install_snapshot']
+  traps='\n'.join(re.findall(r'^trap .* (?:EXIT|INT|TERM)$', SRC, re.M))
+  for failure in ('stop','process','restore','restart'):
+   with self.subTest(failure=failure):
+    self.run_case(names,'FAILURE='+failure+'\n'+r'''
+ROLLBACK_DIR="$RUN/pending"; mkdir "$ROLLBACK_DIR"
+printf BASELINE > "$ROLLBACK_DIR/config.json"; touch "$ROLLBACK_DIR/was-active"
+printf CURRENT > "$XRAY_CONFIG"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+systemctl() { [[ "$FAILURE" != stop ]]; }
+stop_xray_processes() { [[ "$FAILURE" != process ]]; }
+restore_file() { [[ "$FAILURE" != restore ]] && cp -p "$1" "$2"; }
+restart_xray() { [[ "$FAILURE" != restart ]]; }
+(
+'''+traps+r'''
+ exit 0
+) && exit 81 || result=$?
+[[ $result = 1 && -f "$ROLLBACK_DIR/config.json" ]]
+''')
+ def test_install_interrupt_restores_snapshot(self):
+  names=['begin_install_snapshot','restore_install_snapshot','clear_install_snapshot','on_exit']
+  traps='\n'.join(re.findall(r'^trap .* (?:EXIT|INT|TERM)$', SRC, re.M))
+  for existing in (True,False):
+   with self.subTest(existing=existing):
+    self.run_case([n for n in names if n+'()' in SRC], 'EXISTING='+str(existing).lower()+'\n'+r'''
+mkdir -p "$RUN/system" "$RUN/geo"
+if "$EXISTING"; then printf OLD > "$XRAY_BIN"; printf OLD > "$XRAY_CONFIG"; printf OLDUNIT > "$RUN/system/xray.service"; fi
+systemctl() { [[ "$1" != is-active ]]; }
+pgrep() { return 1; }
+(
+'''+traps+r'''
+ begin_install_snapshot || exit 1
+ printf NEW > "$XRAY_BIN"; printf NEW > "$XRAY_CONFIG"; printf NEWUNIT > "$RUN/system/xray.service"
+ builtin kill -INT "$BASHPID"
+ exit 91
+) && exit 81 || result=$?
+[[ $result = 130 ]]
+if "$EXISTING"; then
+ [[ $(< "$XRAY_BIN") = OLD && $(< "$XRAY_CONFIG") = OLD && $(< "$RUN/system/xray.service") = OLDUNIT ]]
+else
+ [[ ! -e "$XRAY_BIN" && ! -e "$XRAY_CONFIG" && ! -e "$RUN/system/xray.service" ]]
+fi
+''')
+ def test_modify_interrupt_restores_config_and_runtime(self):
+  names=['write_config','rollback_config','clear_rollback','restore_install_snapshot','clear_install_snapshot','on_exit']
+  # The same EXIT/INT/TERM declarations used by the real entrypoint.
+  traps='\n'.join(re.findall(r'^trap .* (?:EXIT|INT|TERM)$', SRC, re.M))
+  for active in (True,False):
+   with self.subTest(active=active):
+    self.run_case([n for n in names if n+'()' in SRC], 'ACTIVE='+str(active).lower()+'\n'+r'''
+STATE=$ACTIVE
+printf '{}' > "$XRAY_CONFIG"
+printf enc > "$ENCRYPTION_INFO"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+validate_encryption_token() { :; }
+service_account() { printf '%s:%s' "$(id -u)" "$(id -g)"; }
+systemctl() {
+ case "$1" in
+ show) if "$STATE"; then printf 'ActiveState=active'; else printf 'ActiveState=inactive'; fi;;
+ is-active) "$STATE";;
+ stop) STATE=false; printf stop >> "$RUN/calls";;
+ *) return 0;; esac
+}
+restart_xray() { printf restart >> "$RUN/calls"; STATE=true; }
+pgrep() { return 1; }
+(
+'''+traps+r'''
+ mv() { command mv "$@" || return 1; if [[ "${!#}" = "$XRAY_CONFIG" && ! -e signaled ]]; then touch signaled; builtin kill -TERM "$BASHPID"; fi; }
+ write_config 443 uuid dec enc encryption || exit 1
+ exit 91
+) && exit 81 || result=$?
+[[ $result = 143 && $(< "$XRAY_CONFIG") = '{}' && $(< "$ENCRYPTION_INFO") = enc ]]
+'''+('grep -q restart "$RUN/calls"\n' if active else '! grep -q restart "$RUN/calls"\n'))
+ def test_restore_uses_atomic_file_replacement(self):
+  self.run_case(['rollback_config','clear_rollback'] + (['restore_file'] if 'restore_file()' in SRC else []),r'''
+ROLLBACK_DIR="$RUN/pending"; mkdir "$ROLLBACK_DIR"
+printf OLD > "$ROLLBACK_DIR/config.json"; chmod 604 "$ROLLBACK_DIR/config.json"; touch -t 202001010101 "$ROLLBACK_DIR/config.json"
+printf NEW > "$XRAY_CONFIG"; ln "$XRAY_CONFIG" "$RUN/old-inode"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+rollback_config || exit 81
+[[ $(< "$XRAY_CONFIG") = OLD && $(< "$RUN/old-inode") = NEW ]]
+[[ $(stat -c '%a:%u:%g:%Y' "$XRAY_CONFIG") = $(stat -c '%a:%u:%g:%Y' "$RUN/old-inode") ]] && exit 82
+[[ $(stat -c %a "$XRAY_CONFIG") = 604 ]]
+''')
  def test_review_rollback_boundaries(self):
   names=['restore_install_snapshot','clear_install_snapshot','begin_install_snapshot','xray_pids','stop_xray_processes']
   self.run_case(names,r'''
@@ -307,15 +438,27 @@ if install_selected 443 uuid encryption; then exit 81; fi
 if install_selected 443 uuid encryption; then exit 81; fi
 [[ -z "$INSTALL_ROLLBACK_DIR" ]]
 '''))
+ def test_stopped_update_rejects_incompatible_config(self):
+  self.run_case(['update_xray','begin_install_snapshot','clear_install_snapshot'],r'''
+mkdir -p "$RUN/system"; printf UNIT > "$RUN/system/xray.service"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+printf ORIGINAL > "$XRAY_CONFIG"
+systemctl() { [[ "$1" != is-active ]]; }
+run_official_installer() { printf '#!/bin/sh\nprintf "checked\\n" >> "%s"\nexit 1\n' "$RUN/parser-calls" > "$XRAY_BIN"; }
+restore_install_snapshot() { touch restored; }
+if update_xray; then exit 81; fi
+[[ -f restored && -s "$RUN/parser-calls" && -d "$INSTALL_ROLLBACK_DIR" ]]
+''')
  def test_update_preserves_stopped(self):
   self.run_case(['update_xray','begin_install_snapshot','clear_install_snapshot'],r'''
 mkdir -p "$RUN/system" "$RUN/geo"; printf UNIT > "$RUN/system/xray.service"
-printf OLD > "$XRAY_BIN"
+printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"; chmod +x "$XRAY_BIN"
+printf '{}' > "$XRAY_CONFIG"
 systemctl() { [[ "$1" != is-active ]]; }
-run_official_installer() { printf NEW > "$XRAY_BIN"; }
+run_official_installer() { printf '# updated\n' >> "$XRAY_BIN"; }
 restart_xray() { exit 81; }
 update_xray
-[[ "$(<"$XRAY_BIN")" = NEW && -z "$INSTALL_ROLLBACK_DIR" ]]
+[[ $(tail -n 1 "$XRAY_BIN") = '# updated' && -z "$INSTALL_ROLLBACK_DIR" ]]
 ''')
  def test_stop_failure_retains_recovery(self):
   self.run_case(['restore_install_snapshot'],r'''
@@ -325,6 +468,19 @@ mkdir -p "$RUN/system"; printf UNIT > "$RUN/system/xray.service"
 systemctl() { return 1; }
 if restore_install_snapshot; then exit 81; fi
 [[ "$(<"$XRAY_CONFIG")" = NEW && -f "$INSTALL_ROLLBACK_DIR/config.json" ]]
+''')
+ def test_failed_restart_checks_residual_processes_before_restore(self):
+  self.run_case(['modify_config','valid_port','valid_uuid'],r'''
+printf '%s' '{"inbounds":[{"port":443,"settings":{"users":[{"id":"00000000-0000-4000-8000-000000000000"}],"decryption":"old"}}]}' > "$XRAY_CONFIG"
+printf enc > "$ENCRYPTION_INFO"
+section_title() { :; }; menu_item() { :; }; prompt_default() { :; }; current_port() { printf 443; }
+read() { case "${!#}" in choice) choice=1;; input) input='';; esac; }
+systemctl() { return 0; }
+write_config() { :; }; restart_xray() { return 1; }
+stop_xray_processes() { touch inspected; return 1; }
+rollback_config() { touch wrongly-restored; }
+modify_config || true
+[[ -f inspected && ! -e wrongly-restored ]]
 ''')
  def test_failed_restore_does_not_restart_partial_config(self):
   self.run_case(['modify_config','valid_port','valid_uuid'],r'''
@@ -336,9 +492,10 @@ read() { case "${!#}" in choice) choice=1;; input) input='';; esac; }
 write_config() { :; }
 systemctl() { return 0; }
 restart_xray() { if [[ -e restarted ]]; then touch BAD_SECOND_RESTART; fi; touch restarted; return 1; }
-rollback_config() { return 1; }
+stop_xray_processes() { :; }
+rollback_config() { touch restore-attempted; return 1; }
 modify_config || true
-[[ ! -e BAD_SECOND_RESTART ]]
+[[ -f restore-attempted && ! -e BAD_SECOND_RESTART ]]
 ''')
  def test_process_identity_and_failure(self):
   self.run_case(['xray_pids','stop_xray_processes'],r'''
@@ -434,6 +591,15 @@ printf NEW > "$RUN/system/xray.service.d/10.conf"
 systemctl() { return 0; }
 restore_install_snapshot
 [[ ! -e "$RUN/system/xray.service.d" && ! -e "$RUN/system/xray@.service.d" ]]
+''')
+ def test_ipv6_subscription_rejects_ipv4_only_listener(self):
+  self.run_case(['show_subscription','valid_port','valid_uuid','uri_encode'],r'''
+printf '%s' '{"inbounds":[{"listen":"0.0.0.0","port":443,"settings":{"users":[{"id":"00000000-0000-4000-8000-000000000000"}],"decryption":"old"}}]}' > "$XRAY_CONFIG"
+printf enc > "$ENCRYPTION_INFO"; printf ORIGINAL > "$SUBSCRIPTION_INFO"
+validate_encryption_token() { :; }
+public_ip() { printf '[2001:db8::7]'; }
+if show_subscription; then exit 81; fi
+[[ $(< "$SUBSCRIPTION_INFO") = ORIGINAL ]]
 ''')
  def test_invalid_subscription_rejected(self):
   self.run_case(['show_subscription','validate_encryption_token','valid_appearance','valid_port','valid_uuid','uri_encode'],r'''

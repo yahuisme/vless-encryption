@@ -2,12 +2,12 @@
 # ==============================================================================
 # Xray VLESS Encryption 极简一键安装脚本
 # 系统支持: Debian 10+ / Ubuntu 20.04+
-# 版本: v26.10.28
+# 版本: v26.11.14
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="v26.10.28"
+SCRIPT_VERSION="v26.11.14"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_INSTALL_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
@@ -21,6 +21,11 @@ INSTALL_MODE=""
 REALITY_SHORT_ID_SET=false
 ROLLBACK_DIR=""
 INSTALL_ROLLBACK_DIR=""
+RECOVERY_PENDING=false
+
+trap 'on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 C_RESET='\033[0m'; C_BOLD='\033[1m'
 C_RED='\033[91m'; C_GREEN='\033[92m'; C_YELLOW='\033[93m'
@@ -321,6 +326,9 @@ write_config() {
           {log:{loglevel:"warning"},inbounds:[{listen:"::",port:$port,protocol:"vless",settings:{users:[{id:$uuid,flow:"xtls-rprx-vision"}],decryption:$decryption},streamSettings:{method:"raw",security:"none"}}],outbounds:[{protocol:"freedom",settings:{},streamSettings:{sockopt:{domainStrategy:"UseIPv4v6"}}}]}' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     if [ "$preserve" = true ]; then
+        if ! jq -se 'length == 1 and (.[0] | type == "object" and (.inbounds | type == "array" and length > 0))' "$XRAY_CONFIG" >/dev/null; then
+            rm -f "$tmp"; error "现有配置必须为包含入站的单个 JSON 对象，未修改配置。"; return 1
+        fi
         merged=$(mktemp "${XRAY_CONFIG}.tmp.XXXXXX.json") || { rm -f "$tmp"; return 1; }
         # Only update owned parameters; preserve listeners, clients and user extensions.
         if ! jq --slurpfile new "$tmp" '
@@ -366,6 +374,15 @@ write_config() {
         fi
         mv -f "$merged" "$tmp" || { rm -f "$tmp" "$merged"; return 1; }
     fi
+    if ! jq -e '
+        .inbounds[0].port as $port |
+        all(.inbounds[1:][]; .port == null or
+            (.port | tostring | split(",") | all(.[];
+                split("-") | if length == 1 then (.[0] | tonumber) != $port
+                elif length == 2 then $port < (.[0] | tonumber) or $port > (.[1] | tonumber)
+                else error("invalid port range") end)))' "$tmp" >/dev/null; then
+        rm -f "$tmp"; error "端口与保留的入站冲突或配置无效，未修改配置。"; return 1
+    fi
     test_log=$(mktemp) || { rm -f "$tmp"; return 1; }
     chmod 600 "$test_log" || { rm -f "$tmp" "$test_log"; return 1; }
     if ! "$XRAY_BIN" run -test -config "$tmp" >"$test_log" 2>&1; then
@@ -379,6 +396,9 @@ write_config() {
        ! { [ ! -f "$REALITY_INFO" ] || cp -p "$REALITY_INFO" "$snapshot/reality.info"; }; then
         rm -rf "$snapshot"; rm -f "$tmp"
         error "无法创建配置快照，未替换现有配置。"; return 1
+    fi
+    if systemctl is-active --quiet xray && ! touch "$snapshot/was-active"; then
+        rm -rf "$snapshot"; rm -f "$tmp"; return 1
     fi
     ROLLBACK_DIR="$snapshot"
     enc_tmp=$(mktemp "${ENCRYPTION_INFO}.tmp.XXXXXX") || { rm -f "$tmp"; return 1; }
@@ -493,6 +513,9 @@ show_subscription() {
         return 1
     }
     address=$(public_ip) || { error "无法获取公网 IP，无法生成订阅链接。"; return 1; }
+    if [[ "$address" = \[*\] ]] && ! jq -e '(.inbounds[0].listen // "::") | contains(":")' "$XRAY_CONFIG" >/dev/null; then
+        error "公网地址为 IPv6，但入站监听不支持 IPv6，未生成订阅。"; return 1
+    fi
     uuid=$(jq -r '(.inbounds[0].settings.clients // .inbounds[0].settings.users)[0].id' "$XRAY_CONFIG"); port=$(jq -r '.inbounds[0].port' "$XRAY_CONFIG"); encryption=$(<"$ENCRYPTION_INFO")
     if ! valid_port "$port" || ! valid_uuid "$uuid" || ! validate_encryption_token "$encryption" 0rtt; then
         error "客户端加密信息或配置参数无效，未生成订阅链接。"; return 1
@@ -673,22 +696,63 @@ uninstall_xray() {
     success "Xray、配置、客户端信息及本脚本已清除。"
 }
 
+restore_file() {
+    local source="$1" target="$2" temporary
+    temporary=$(mktemp "${target}.restore.XXXXXX") || return 1
+    if ! cp -p "$source" "$temporary" || ! mv -f "$temporary" "$target"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+on_exit() {
+    local status="${1:-1}" was_active=false failed=false
+    trap - EXIT INT TERM
+    if [ "${RECOVERY_PENDING:-false}" = true ]; then
+        failed=true
+    else
+        if [ -n "$INSTALL_ROLLBACK_DIR" ]; then
+            restore_install_snapshot || failed=true
+        elif [ -n "$ROLLBACK_DIR" ]; then
+            [ ! -f "$ROLLBACK_DIR/was-active" ] || was_active=true
+            RECOVERY_PENDING=true
+            if systemctl stop xray && stop_xray_processes && rollback_config true; then
+                if "$was_active"; then restart_xray || failed=true; fi
+                if ! "$failed"; then clear_rollback || failed=true; fi
+            else
+                failed=true
+            fi
+        fi
+    fi
+    if "$failed"; then
+        error "退出恢复未完成，请检查保留材料：${INSTALL_ROLLBACK_DIR:-${ROLLBACK_DIR:-$XRAY_CONFIG}}"
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
+}
+
 rollback_config() {
     if [ -z "$ROLLBACK_DIR" ] || [ ! -d "$ROLLBACK_DIR" ]; then return 0; fi
+    RECOVERY_PENDING=true
     error "正在恢复上一次可用配置..."
     local failed=false
-    if [ -f "$ROLLBACK_DIR/config.json" ]; then cp -p "$ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
-    if [ -f "$ROLLBACK_DIR/encryption.info" ]; then cp -p "$ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
-    if [ -f "$ROLLBACK_DIR/reality.info" ]; then cp -p "$ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
+    if [ -f "$ROLLBACK_DIR/config.json" ]; then restore_file "$ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
+    if [ -f "$ROLLBACK_DIR/encryption.info" ]; then restore_file "$ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
+    if [ -f "$ROLLBACK_DIR/reality.info" ]; then restore_file "$ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
     if [ -f "$XRAY_CONFIG" ] && ! "$XRAY_BIN" run -test -config "$XRAY_CONFIG" >/dev/null 2>&1; then failed=true; fi
     if [ "$failed" = true ]; then
         error "配置回滚失败，请手动恢复；快照保留在 $ROLLBACK_DIR"
         return 1
     fi
-    clear_rollback || return 1
+    if [ "${1:-false}" != true ]; then clear_rollback || return 1; fi
     success "配置回滚完成。"
 }
-clear_rollback() { [ -z "$ROLLBACK_DIR" ] || { rm -rf "$ROLLBACK_DIR" || return 1; ROLLBACK_DIR=""; }; }
+clear_rollback() {
+    local dir="$ROLLBACK_DIR"
+    ROLLBACK_DIR=""
+    RECOVERY_PENDING=false
+    [ -z "$dir" ] || rm -rf "$dir"
+}
 begin_install_snapshot() {
     local dir geo
     if { [ -n "$INSTALL_ROLLBACK_DIR" ] && [ -d "$INSTALL_ROLLBACK_DIR" ]; } ||
@@ -719,6 +783,7 @@ begin_install_snapshot() {
 }
 restore_install_snapshot() {
     if [ -z "$INSTALL_ROLLBACK_DIR" ] || [ ! -d "$INSTALL_ROLLBACK_DIR" ]; then return 0; fi
+    RECOVERY_PENDING=true
     error "正在恢复安装前的配置和 Xray 核心..."
     local failed=false geo fresh=false
     [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ] || fresh=true
@@ -733,19 +798,19 @@ restore_install_snapshot() {
     if ! stop_xray_processes; then
         error "无法确认残留进程已停止；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
     fi
-    if [ -f "$INSTALL_ROLLBACK_DIR/xray" ]; then cp -p "$INSTALL_ROLLBACK_DIR/xray" "$XRAY_BIN" || failed=true; else rm -f "$XRAY_BIN" || failed=true; fi
-    if [ -f "$INSTALL_ROLLBACK_DIR/config.json" ]; then cp -p "$INSTALL_ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
-    if [ -f "$INSTALL_ROLLBACK_DIR/encryption.info" ]; then cp -p "$INSTALL_ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
-    if [ -f "$INSTALL_ROLLBACK_DIR/reality.info" ]; then cp -p "$INSTALL_ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
+    if [ -f "$INSTALL_ROLLBACK_DIR/xray" ]; then restore_file "$INSTALL_ROLLBACK_DIR/xray" "$XRAY_BIN" || failed=true; else rm -f "$XRAY_BIN" || failed=true; fi
+    if [ -f "$INSTALL_ROLLBACK_DIR/config.json" ]; then restore_file "$INSTALL_ROLLBACK_DIR/config.json" "$XRAY_CONFIG" || failed=true; else rm -f "$XRAY_CONFIG" || failed=true; fi
+    if [ -f "$INSTALL_ROLLBACK_DIR/encryption.info" ]; then restore_file "$INSTALL_ROLLBACK_DIR/encryption.info" "$ENCRYPTION_INFO" || failed=true; else rm -f "$ENCRYPTION_INFO" || failed=true; fi
+    if [ -f "$INSTALL_ROLLBACK_DIR/reality.info" ]; then restore_file "$INSTALL_ROLLBACK_DIR/reality.info" "$REALITY_INFO" || failed=true; else rm -f "$REALITY_INFO" || failed=true; fi
     for geo in geoip.dat geosite.dat; do
         if [ -f "$INSTALL_ROLLBACK_DIR/$geo" ]; then
-            cp -p "$INSTALL_ROLLBACK_DIR/$geo" "/usr/local/share/xray/$geo" || failed=true
+            restore_file "$INSTALL_ROLLBACK_DIR/$geo" "/usr/local/share/xray/$geo" || failed=true
         else
             rm -f "/usr/local/share/xray/$geo" || failed=true
         fi
     done
     if [ -f "$INSTALL_ROLLBACK_DIR/xray.service" ]; then
-        cp -p "$INSTALL_ROLLBACK_DIR/xray.service" /etc/systemd/system/xray.service || failed=true
+        restore_file "$INSTALL_ROLLBACK_DIR/xray.service" /etc/systemd/system/xray.service || failed=true
     elif [ ! -f "$INSTALL_ROLLBACK_DIR/xray" ]; then
         rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service || failed=true
         rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d || failed=true
@@ -757,10 +822,17 @@ restore_install_snapshot() {
     if [ "$failed" = true ]; then
         error "安装回滚失败，请手动恢复；快照保留在 $INSTALL_ROLLBACK_DIR"; return 1
     fi
+    # 外层已恢复，内层对应中间状态，必须先取消其恢复资格。
+    clear_rollback || return 1
     clear_install_snapshot || return 1
     success "安装回滚完成。"
 }
-clear_install_snapshot() { [ -z "$INSTALL_ROLLBACK_DIR" ] || { rm -rf "$INSTALL_ROLLBACK_DIR" || return 1; INSTALL_ROLLBACK_DIR=""; }; }
+clear_install_snapshot() {
+    local dir="$INSTALL_ROLLBACK_DIR"
+    INSTALL_ROLLBACK_DIR=""
+    RECOVERY_PENDING=false
+    [ -z "$dir" ] || rm -rf "$dir"
+}
 update_xray() {
     [ -f /etc/systemd/system/xray.service ] || { error "主服务文件缺失，请先恢复 /etc/systemd/system/xray.service。"; return 1; }
     begin_install_snapshot || { error "无法创建更新回滚快照。"; return 1; }
@@ -770,10 +842,12 @@ update_xray() {
         error "Xray 更新失败，正在回滚。"
     elif ! run_official_installer install-geodata; then
         error "GeoIP/GeoSite 更新失败，正在回滚。"
+    elif ! "$XRAY_BIN" run -test -config "$XRAY_CONFIG"; then
+        error "新核心无法加载现有配置，正在回滚。"
     elif ! { if [ -f "$INSTALL_ROLLBACK_DIR/was-active" ]; then restart_xray; else systemctl stop xray; fi; }; then
         error "恢复 Xray 运行状态失败，正在回滚。"
     else
-        clear_install_snapshot
+        clear_install_snapshot || return 1
         success "Xray 更新完成。"
         return 0
     fi
@@ -782,7 +856,6 @@ update_xray() {
 }
 abort_install() {
     restore_install_snapshot || return 1
-    clear_rollback
     return 1
 }
 uri_encode() { jq -nr --arg value "$1" '$value | @uri'; }
@@ -859,8 +932,8 @@ install_selected() {
         abort_install || return 1
         return 1
     fi
-    clear_install_snapshot
-    clear_rollback
+    clear_rollback || return 1
+    clear_install_snapshot || return 1
     success "安装完成：$([ "$mode" = reality ] && echo 'VLESS Encryption + REALITY' || echo 'VLESS Encryption')。"
     show_subscription || info "Xray 已安装并运行，但暂时无法生成订阅链接。"
     return 0
@@ -984,7 +1057,9 @@ modify_config() {
     fi
     if [ "$was_active" = true ] && ! restart_xray; then
         error "正在回滚配置。"
+        RECOVERY_PENDING=true
         systemctl stop xray || { error "停止 Xray 失败，快照保留在 $ROLLBACK_DIR"; return 1; }
+        stop_xray_processes || { error "残留进程未退出，快照保留在 $ROLLBACK_DIR"; return 1; }
         rollback_config || return 1
         if ! restart_xray; then
             error "回滚后 Xray 仍未运行，请立即检查服务和配置。"
