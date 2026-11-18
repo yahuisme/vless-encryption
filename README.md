@@ -1,6 +1,6 @@
 # vless-encryption
 
-脚本版本：`v26.11.19`。
+版本：v26.11.19
 
 一键安装和管理 Xray 的 **VLESS Encryption**，可选叠加 **REALITY**。客户端及其内核须支持 VLESS Encryption、链接中的 `encryption` 参数和 Vision；仅支持普通 VLESS/REALITY 的客户端不适用。
 
