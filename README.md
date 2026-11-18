@@ -1,5 +1,7 @@
 # vless-encryption
 
+脚本版本：`v26.11.19`。
+
 一键安装和管理 Xray 的 **VLESS Encryption**，可选叠加 **REALITY**。客户端及其内核须支持 VLESS Encryption、链接中的 `encryption` 参数和 Vision；仅支持普通 VLESS/REALITY 的客户端不适用。
 
 ## 使用
@@ -22,6 +24,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/ma
 再次运行上方命令，按菜单更新、重启、卸载、修改配置 / 切换模式或查看订阅与日志。
 
 - 配置：`/usr/local/etc/xray/config.json`；节点链接：`/root/xray_vless_link.txt`。
+- 保存配置时会清除本地缓存的链接文件；如未能自动重新生成，可稍后用菜单 `7` 重试。客户端已导入的链接是否仍可用，取决于连接参数是否改变。
 - 客户端参数：`/root/xray_encryption_info.txt`、`/root/xray_reality_info.txt`；含连接凭据，请勿公开。
 - 日志：`journalctl -u xray -f --no-pager`，按 Ctrl+C 退出。
 - **安装 / 重装覆盖整个 Xray 配置，含自定义内容，请先备份；重装后重新导入节点。**
@@ -29,7 +32,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yahuisme/vless-encryption/ma
 - 新配置使用官方 `users`、`method: raw` 和 REALITY `target` 字段；旧配置仍可读取，修改时迁移相关字段并保留其余内容。
 - REALITY 配置已有 `mldsa65Seed` 时，订阅自动附带官方 `pqv` 验证公钥；客户端须支持 ML-DSA-65，默认不启用。
 - 保留模式时保留加密密钥；**切换模式按默认 `mlkem768/native` 重生密钥，必须重新导入节点。**
-- 更新和修改配置保留原运行状态；更新保留服务文件，失败时尝试回滚。恢复失败时保留快照，不重启混合配置。请勿并发运行。
+- 更新和修改配置保留原运行状态；更新保留服务文件，失败时尝试回滚。恢复失败时保留快照，当前菜单只允许查看日志或退出。请勿并发运行。
 - **卸载清除整个 Xray、配置、日志和客户端信息，含自定义内容；输入 `y` 确认，回车取消。** 成功后也会删除本地执行的脚本；上方远程命令不留下本地脚本。
 
 <details>
